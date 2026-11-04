@@ -1,0 +1,1 @@
+import{V as u,i as s,l as n}from"./index-DilqS6TQ.js";import{s as a}from"./shops-DK4Avzly.js";const i=u("shop",()=>{const e=s([]),o=s(null),r=n(()=>e.value.find(t=>t.id===o.value)||null);return{shops:e,currentShopId:o,currentShop:r,fetchShops:async()=>{e.value=await a.getShops(),e.value.length>0&&!o.value&&(o.value=e.value[0].id)},setCurrentShop:t=>{o.value=t}}});export{i as u};

@@ -1,0 +1,62 @@
+target/
+*.class
+*.jar
+*.war
+*.ear
+
+# Logs
+logs/
+*.log
+
+# Temp files
+data/temp/*
+!data/temp/.gitkeep
+
+# Debug screenshots
+data/debug/*
+!data/debug/.gitkeep
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Release packages & bundled runtimes
+release/
+jre/
+jre17-custom/
+python-runtime/
+app.jar
+
+# Runtime data (database, browser profiles, screenshots, uploads)
+data/
+backup/
+
+# Frontend build output & deps
+frontend/dist/
+frontend/node_modules/
+
+# Local tooling
+.codex/
+.screenshots/

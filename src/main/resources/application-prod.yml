@@ -1,0 +1,74 @@
+spring:
+  application:
+    name: bad-review-control
+
+  # 生产环境数据源配置 - MySQL
+  datasource:
+    url: jdbc:mysql://localhost:3306/badreview_db?useUnicode=true&characterEncoding=utf8&useSSL=true&serverTimezone=Asia/Shanghai
+    username: badreview_user
+    password: ${DB_PASSWORD:ChangeThisPassword123!}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+  # JPA 配置
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: false
+        use_sql_comments: false
+    open-in-view: false
+
+  # 关闭 H2 控制台
+  h2:
+    console:
+      enabled: false
+
+# 服务器配置
+server:
+  port: 8080
+  compression:
+    enabled: true
+    mime-types: text/html,text/xml,text/plain,text/css,text/javascript,application/javascript,application/json
+  error:
+    include-message: never
+    include-stacktrace: never
+
+# 日志配置
+logging:
+  level:
+    root: INFO
+    com.example.meituan: INFO
+    org.springframework: WARN
+    org.hibernate: WARN
+  file:
+    name: logs/badreview.log
+  logback:
+    rollingpolicy:
+      max-file-size: 10MB
+      max-history: 30
+      total-size-cap: 1GB
+
+# JWT 配置
+jwt:
+  secret: ${JWT_SECRET:YourProductionSecretKeyMustBeAtLeast32CharactersLong123456}
+  expiration: 86400000
+
+# 备份配置
+backup:
+  enabled: true
+  path: backup/database
+  max-backups: 30
+  schedule: "0 0 2 * * ?"
+
+# 生产环境标识
+app:
+  env: production
