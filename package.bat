@@ -1,5 +1,7 @@
 @echo off
 chcp 65001 >nul
+cd /d "%~dp0"
+
 title 打包差评智控系统
 
 echo ========================================
@@ -9,7 +11,7 @@ echo.
 
 REM 检查 Maven
 echo [1/4] 检查 Maven 环境...
-mvn -version >nul 2>&1
+call mvn -version >nul 2>&1
 if %errorlevel% neq 0 (
     echo [错误] 未检测到 Maven
     pause
@@ -39,14 +41,14 @@ REM 创建发布目录
 echo.
 echo [4/4] 创建发布包...
 set "RELEASE_DIR=release"
-set "APP_NAME=差评智控系统-v1.0.0"
+set "APP_NAME=差评智控系统-v1.3.0"
 
-if exist "%RELEASE_DIR%" rmdir /s /q "%RELEASE_DIR%"
+if exist "%RELEASE_DIR%\%APP_NAME%" rmdir /s /q "%RELEASE_DIR%\%APP_NAME%"
 mkdir "%RELEASE_DIR%\%APP_NAME%"
 
 REM 复制文件
 echo 复制应用文件...
-copy "target\meituan-review-automation-1.0.0-SNAPSHOT.jar" "%RELEASE_DIR%\%APP_NAME%\app.jar"
+copy "target\meituan-review-automation-1.3.0.jar" "%RELEASE_DIR%\%APP_NAME%\app.jar"
 copy "start.bat" "%RELEASE_DIR%\%APP_NAME%\"
 copy "stop.bat" "%RELEASE_DIR%\%APP_NAME%\"
 copy "README.md" "%RELEASE_DIR%\%APP_NAME%\" 2>nul
@@ -56,7 +58,7 @@ mkdir "%RELEASE_DIR%\%APP_NAME%\data\database"
 mkdir "%RELEASE_DIR%\%APP_NAME%\logs"
 
 REM 创建说明文件
-echo 差评智控系统 v1.0.0> "%RELEASE_DIR%\%APP_NAME%\使用说明.txt"
+echo 差评智控系统 v1.3.0> "%RELEASE_DIR%\%APP_NAME%\使用说明.txt"
 echo.>> "%RELEASE_DIR%\%APP_NAME%\使用说明.txt"
 echo 运行要求：>> "%RELEASE_DIR%\%APP_NAME%\使用说明.txt"
 echo - Java 17 或更高版本>> "%RELEASE_DIR%\%APP_NAME%\使用说明.txt"

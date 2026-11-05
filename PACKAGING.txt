@@ -1,0 +1,9 @@
+
+Fresh-install ZIP packaging
+---------------------------
+After assembling the release folder, run:
+  python package-release.py "release/蓝星-v1.3.0"
+The ZIP builder uses an application-file allowlist, creates explicit empty runtime
+folders, and excludes all existing data, backup and log contents plus Python caches
+and test helpers. It validates ZIP integrity before replacing the output and writes
+a .manifest.json exclusion summary beside it. The source folder is left intact.

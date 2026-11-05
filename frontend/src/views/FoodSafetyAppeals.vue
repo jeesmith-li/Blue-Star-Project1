@@ -87,10 +87,10 @@
         @change="onPickTpl">
         <el-option v-for="t in appealTpls" :key="t.id" :label="t.name" :value="t.id" />
       </el-select>
-      <el-input v-model="manualReason" type="textarea" :rows="5" maxlength="2000" show-word-limit
-        placeholder="填写申诉理由（美团要求大于20字）" />
-      <div class="reason-hint" :class="{ ok: manualReason.trim().length >= 20 }">
-        已输入 {{ manualReason.trim().length }} 字{{ manualReason.trim().length >= 20 ? '' : '（需大于20字）' }}
+      <el-input v-model="manualReason" type="textarea" :rows="5" maxlength="300" show-word-limit
+        placeholder="填写申诉理由（20至300字）" />
+      <div class="reason-hint" :class="{ ok: manualReason.trim().length >= 20 && manualReason.trim().length <= 300 }">
+        已输入 {{ manualReason.trim().length }} 字{{ manualReason.trim().length >= 20 && manualReason.trim().length <= 300 ? '' : '（需20至300字）' }}
       </div>
       <template #footer>
         <el-button @click="manualVisible = false">取消</el-button>
@@ -245,7 +245,7 @@ const onPickTpl = (tplId: number | undefined) => {
 const submitManual = async () => {
   if (!manualRow.value) return
   const reason = manualReason.value.trim()
-  if (reason.length < 20) return ElMessage.warning('申诉理由需大于20字（美团要求）')
+  if (reason.length < 20 || reason.length > 300) return ElMessage.warning('食安申诉理由须为20至300字')
   const ok = await confirmAction(
     '提交食安申诉',
     `即将提交该条食安申诉（订单号：${manualRow.value.orderNo}），理由共 ${reason.length} 字。\n提交到美团后无法撤回，请确认理由与凭证无误。`

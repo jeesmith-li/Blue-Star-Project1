@@ -14,7 +14,16 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: 'http://localhost:8080',
-        changeOrigin: true
+        changeOrigin: true,
+        // The local backend allows the original development origin on port 3000.
+        // Keep alternate Vite preview ports compatible with that CORS policy.
+        configure(proxy) {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            if (req.headers.origin) {
+              proxyReq.setHeader('Origin', 'http://localhost:3000')
+            }
+          })
+        }
       }
     }
   }

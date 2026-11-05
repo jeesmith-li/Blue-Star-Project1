@@ -104,4 +104,18 @@ public class ShopService {
         shopRepository.deleteById(id);
         return true;
     }
+    @Autowired
+    private com.example.meituan.web.repository.FoodSafetyAppealRepository foodSafetyAppealRepository;
+
+    @Autowired
+    private com.example.meituan.web.repository.NegativeFeedbackRepository negativeFeedbackRepository;
+
+    @org.springframework.transaction.annotation.Transactional
+    public void forceDeleteShop(Long id) {
+        foodSafetyAppealRepository.deleteByShopId(id);
+        negativeFeedbackRepository.deleteByShopId(id);
+        reviewRepository.deleteByShopId(id);
+        shopRepository.deleteById(id);
+    }
+
 }

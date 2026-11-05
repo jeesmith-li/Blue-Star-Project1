@@ -16,5 +16,7 @@ public interface FoodSafetyAppealRepository extends JpaRepository<FoodSafetyAppe
 
     List<FoodSafetyAppeal> findByShopIdAndMtStatus(Long shopId, Integer mtStatus);
 
+    void deleteByShopId(Long shopId);
+
     long countByShopId(Long shopId);
 }

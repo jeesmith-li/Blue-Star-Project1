@@ -69,6 +69,10 @@ public class Shop {
     /** 执行顺序：自动化按该值升序逐店处理（为空时按ID顺序） */
     private Integer sortOrder;
 
+    // Retained for compatibility with existing v1.2.9 databases.
+    @Column(nullable = false, columnDefinition = "boolean default false")
+    private Boolean firstAutomationDeducted = false;
+
     // Getters and Setters
     public Long getId() {
         return id;

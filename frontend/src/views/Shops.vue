@@ -5,6 +5,9 @@
         <el-icon><Plus /></el-icon>
         添加店铺
       </el-button>
+      <el-button type="danger" plain :disabled="shops.length === 0 || deleting" :loading="deleting" @click="deleteStores([...shops], '全部店铺')">
+        删除全部店铺
+      </el-button>
     </div>
 
     <div class="card">
@@ -64,9 +67,19 @@
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
-            <el-button text type="danger" size="small" @click="handleDeleteAccount(row)">
-              删除
-            </el-button>
+            <el-dropdown trigger="click" :disabled="deleting" @command="(cmd: number | string) => handleDeleteCommand(row, cmd)">
+              <el-button text type="danger" size="small" :disabled="deleting">
+                删除店铺<el-icon><ArrowDown /></el-icon>
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="__all__">删除此账号全部店铺（{{ row.shops.length }}家）</el-dropdown-item>
+                  <el-dropdown-item v-for="s in row.shops" :key="s.id" :command="s.id" divided>
+                    删除：{{ s.name }}（店铺ID: {{ s.poiId || '未获取' }}）
+                  </el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
           </template>
         </el-table-column>
       </el-table>
@@ -109,7 +122,9 @@
         </p>
         <el-table :data="scrapedShops" max-height="300" size="small" @selection-change="handleSelectionChange">
           <el-table-column type="selection" width="50" />
+          <el-table-column prop="poiId" label="美团店铺ID" width="130" />
           <el-table-column prop="name" label="店铺名称" />
+          <el-table-column prop="businessStatus" label="营业状态" width="100" />
         </el-table>
         <div v-if="scrapedShops.length === 0" style="text-align: center; padding: 20px; color: #909399;">
           未获取到店铺，请确认已登录正确的美团商家账号
@@ -316,17 +331,19 @@ const fetchScrapedShops = async () => {
   try {
     const res = await browserApi.scrapeShops()
     if (res.success) {
-      scrapedShops.value = res.shops || []
+      scrapedShops.value = (res.shops || []).filter(s => ['营业中', '休息中'].includes(s.businessStatus) && /^\d+$/.test(s.poiId))
       scrapedAccount.value = res.account || ''
       step.value = 'select'
       if (scrapedShops.value.length === 0) {
         ElMessage.warning('未获取到店铺数据，你也可以取消后手动添加')
       }
     } else {
-      ElMessage.error('获取店铺列表失败')
+      step.value = 'start'
+      ElMessage.error(res.message || '获取店铺列表失败')
     }
   } catch (e: any) {
-    ElMessage.error(e?.message || '获取店铺失败')
+    step.value = 'start'
+    ElMessage.error(e?.response?.data?.message || e?.message || '获取店铺失败')
   }
 }
 
@@ -337,13 +354,21 @@ const handleSelectionChange = (rows: ScrapedShop[]) => {
 const handleBind = async () => {
   binding.value = true
   try {
-    await browserApi.bindShop({
+    const result: any = await browserApi.bindShop({
       meituanAccount: scrapedAccount.value || '美团账号',
-      shops: selectedShops.value.map(s => ({ name: s.name }))
+      shops: selectedShops.value.map(s => ({ name: s.name, poiId: s.poiId, businessStatus: s.businessStatus }))
     })
-    ElMessage.success(`成功绑定 ${selectedShops.value.length} 个店铺`)
-    dialogVisible.value = false
-    fetchShops()
+    if (!result.success) {
+      ElMessage.error(result.message || '绑定失败，未写入店铺')
+      return
+    }
+    if (result.data?.failed > 0) {
+      ElMessage.warning(result.message)
+    } else {
+      ElMessage.success(result.message || `成功绑定 ${result.data?.bound || 0} 个店铺`)
+      dialogVisible.value = false
+    }
+    await fetchShops()
   } catch (e: any) {
     ElMessage.error(e?.message || '绑定失败')
   } finally {
@@ -372,19 +397,60 @@ const handleViewReviews = (group: AccountGroup, cmd: any) => {
   }
 }
 
-const handleDeleteAccount = async (group: AccountGroup) => {
+const deleting = ref(false)
+
+const handleDeleteCommand = (group: AccountGroup, command: number | string) => {
+  const targets = command === '__all__' ? [...group.shops] : group.shops.filter(s => s.id === Number(command))
+  if (targets.length) void deleteStores(targets, command === '__all__' ? `账号「${group.account}」下全部店铺` : `店铺「${targets[0].name}」`)
+}
+
+const deleteStores = async (targets: Shop[], label: string) => {
+  if (deleting.value || targets.length === 0) return
+  deleting.value = true
   try {
     await ElMessageBox.confirm(
-      `确定删除账号"${group.account}"下的全部 ${group.shops.length} 个店铺吗？`,
-      '删除确认', { type: 'warning' }
+      `确定删除${label}，共 ${targets.length} 家吗？此操作不可撤销。有历史评价时，可验证当前登录用户密码后强制删除。`,
+      '删除确认', { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
     )
-    for (const s of group.shops) {
-      try { await shopsApi.deleteShop(s.id) } catch { /* 有评价数据的店可能删不掉，忽略 */ }
+    let deleted = 0
+    const failures: string[] = []
+    for (const shop of targets) {
+      try {
+        await shopsApi.deleteShop(shop.id)
+        shops.value = shops.value.filter(s => s.id !== shop.id)
+        deleted++
+      } catch (error: any) {
+        if (error?.response?.status === 400 && error?.response?.data?.message?.includes('历史评价')) {
+          try {
+            const { value: password } = await ElMessageBox.prompt(
+              `「${shop.name}」存在历史评价。强制删除将永久删除店铺及关联评价、申诉和反馈。请输入当前登录用户的密码验证：`,
+              '强制删除验证', {
+                inputType: 'password', inputValidator: value => !!value?.trim() || '请输入密码',
+                confirmButtonText: '验证并强制删除', cancelButtonText: '保留店铺',
+                closeOnClickModal: false
+              }
+            )
+            await shopsApi.forceDeleteShop(shop.id, password)
+            shops.value = shops.value.filter(s => s.id !== shop.id)
+            deleted++
+            continue
+          } catch (forceError: any) {
+            failures.push(`${shop.name}：${forceError === 'cancel' || forceError === 'close' ? '已保留' : forceError?.response?.data?.message || '强制删除失败'}`)
+            continue
+          }
+        }
+        failures.push(`${shop.name}（ID: ${shop.poiId || '未获取'}）：${error?.response?.data?.message || error?.message || '删除失败'}`)
+      }
     }
-    ElMessage.success('删除完成')
-    fetchShops()
-  } catch (e: any) {
-    if (e !== 'cancel') ElMessage.error(e?.message || '删除失败')
+    if (failures.length) {
+      await ElMessageBox.alert(`成功删除 ${deleted} 家，失败 ${failures.length} 家。\n${failures.join('\n')}`, '删除结果', { type: 'warning' })
+    } else {
+      ElMessage.success(`成功删除 ${deleted} 家店铺`)
+    }
+  } catch (error: any) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error?.message || '删除失败')
+  } finally {
+    deleting.value = false
   }
 }
 

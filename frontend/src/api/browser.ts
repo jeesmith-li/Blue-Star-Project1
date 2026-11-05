@@ -4,6 +4,8 @@ export interface ScrapedShop {
   id: string
   name: string
   source: string
+  poiId: string
+  businessStatus: string
 }
 
 export const browserApi = {
@@ -18,12 +20,12 @@ export const browserApi = {
   },
 
   /** 登录成功后爬取店铺列表 */
-  scrapeShops(): Promise<{ success: boolean; account: string; shops: ScrapedShop[]; count: number }> {
-    return request.post('/browser/scrape-shops')
+  scrapeShops(): Promise<{ success: boolean; message?: string; account: string; shops: ScrapedShop[]; count: number }> {
+    return request.post('/browser/scrape-shops', undefined, { timeout: 60000 })
   },
 
   /** 批量绑定选中的店铺 */
-  bindShop(data: { meituanAccount: string; shops: { name: string }[] }) {
+  bindShop(data: { meituanAccount: string; shops: { name: string; poiId: string; businessStatus: string }[] }) {
     return request.post('/browser/bind-shop', data)
   },
 

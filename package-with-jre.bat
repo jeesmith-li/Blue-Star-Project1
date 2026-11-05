@@ -1,5 +1,7 @@
 @echo off
 chcp 65001 >nul
+cd /d "%~dp0"
+
 title 打包差评智控系统（含JRE）
 
 echo ========================================
@@ -28,7 +30,7 @@ echo [成功] jlink 已就绪
 
 REM 检查 Maven
 echo [2/6] 检查 Maven 环境...
-mvn -version >nul 2>&1
+call mvn -version >nul 2>&1
 if %errorlevel% neq 0 (
     echo [错误] 未检测到 Maven
     pause
@@ -71,7 +73,7 @@ echo [成功] 自定义 JRE 创建完成
 REM 创建发布目录
 echo [5/6] 创建发布包...
 set "RELEASE_DIR=release"
-set "APP_NAME=差评智控系统-v1.0.0-完整版"
+set "APP_NAME=差评智控系统-v1.3.0-完整版"
 
 if exist "%RELEASE_DIR%\%APP_NAME%" rmdir /s /q "%RELEASE_DIR%\%APP_NAME%"
 mkdir "%RELEASE_DIR%\%APP_NAME%"
@@ -82,7 +84,7 @@ xcopy /E /I /Q "%JRE_DIR%" "%RELEASE_DIR%\%APP_NAME%\jre"
 
 REM 复制应用文件
 echo 复制应用文件...
-copy "target\meituan-review-automation-1.0.0-SNAPSHOT.jar" "%RELEASE_DIR%\%APP_NAME%\app.jar"
+copy "target\meituan-review-automation-1.3.0.jar" "%RELEASE_DIR%\%APP_NAME%\app.jar"
 
 REM 创建启动脚本（使用内置 JRE）
 echo 创建启动脚本...
@@ -158,7 +160,7 @@ mkdir "%RELEASE_DIR%\%APP_NAME%\logs"
 REM 创建说明文件
 (
 echo ========================================
-echo     蓝星 - 差评智控系统 v1.0.0
+echo     蓝星 - 差评智控系统 v1.3.0
 echo     Blue Star Review Control System
 echo     完整版（包含 Java 运行环境）
 echo ========================================
@@ -208,6 +210,16 @@ echo 日期: 2026-09-15
 echo.
 echo ========================================
 ) > "%RELEASE_DIR%\%APP_NAME%\使用说明.txt"
+
+REM Include required automation runtime, then build a clean fresh-install ZIP.
+if not exist "python-runtime\python.exe" (
+    echo [ERROR] Missing python-runtime\python.exe
+    exit /b 1
+)
+xcopy /E /I /Q /Y "python" "%RELEASE_DIR%\%APP_NAME%\python"
+xcopy /E /I /Q /Y "python-runtime" "%RELEASE_DIR%\%APP_NAME%\python-runtime"
+python package-release.py "%RELEASE_DIR%\%APP_NAME%"
+if errorlevel 1 exit /b 1
 
 REM 显示统计信息
 echo [6/6] 生成统计信息...

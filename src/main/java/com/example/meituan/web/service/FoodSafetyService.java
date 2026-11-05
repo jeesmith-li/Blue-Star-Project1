@@ -172,6 +172,12 @@ public class FoodSafetyService {
     private Map<String, Object> submitOne(Shop shop, FoodSafetyAppeal fs,
                                           String reason, String templateMark, String operator) throws Exception {
         Map<String, Object> result = new LinkedHashMap<>();
+        reason = reason == null ? "" : reason.trim();
+        if (reason.length() < 20 || reason.length() > 300) {
+            result.put("success", false);
+            result.put("message", "食安申诉理由须为20至300字，请修改理由或模板后重试");
+            return result;
+        }
         JsonNode resp = browserAutomationService.appealFoodSafety(
                 shop.getName(), List.of(fs.getOrderNo()), reason, shop.getPoiId());
         String type = resp.path("type").asText("");
