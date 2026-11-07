@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+import hashlib
 import subprocess
 import traceback
 
@@ -79,22 +80,49 @@ def _get_ocr():
     return _rapid_ocr
 
 
+# 调试截图开关：默认关闭，避免每次 OCR 都往 data/debug 写 PNG（磁盘 I/O 占 OCR 流程 15%~25%）
+_DEBUG_SHOTS = os.environ.get("BLUESTAR_DEBUG_SHOTS", "0") == "1"
+
+
+def _save_debug(img, path):
+    """仅在 BLUESTAR_DEBUG_SHOTS=1 时落盘调试图"""
+    if not _DEBUG_SHOTS or not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        img.save(path)
+    except Exception:
+        pass
+
+
+def _shot(page):
+    """截取当前视口，返回 PIL.Image（走内存，不落盘）"""
+    import io as _io
+    from PIL import Image
+    data = page.screenshot()
+    return Image.open(_io.BytesIO(data))
+
+
+def _ocr_img(img):
+    """对 PIL.Image 直接 OCR（省去 PNG 写入/再读盘），返回 (res, elapse)"""
+    import numpy as _np
+    return _get_ocr()(_np.array(img))
+
+
 def _find_pager_point(page, expected, shot_path):
     """通过 OCR 定位底部分页器上指定期望页码的点击坐标(CSS 像素)。
     美团分页器数字等间距排列：用 OCR 认出的数字做线性拟合，推算目标页码的 x。
     找不到返回 None。"""
     try:
-        page.screenshot(path=shot_path)
         from PIL import Image
-        im = Image.open(shot_path)
+        im = _shot(page)
         W, H = im.size
         y0 = int(H * 0.65)  # 只取底部 35%（分页器所在区域）
         crop = im.crop((0, y0, W, H))
         scale = 3
         crop = crop.resize((crop.width * scale, crop.height * scale), Image.LANCZOS)
-        crop_path = shot_path + ".crop.png"
-        crop.save(crop_path)
-        res, _ = _get_ocr()(crop_path)
+        _save_debug(crop, shot_path)
+        res, _ = _ocr_img(crop)
         pts = []  # (digit, x, y) in scaled-crop coords
         if res:
             for it in res:
@@ -166,20 +194,211 @@ def _find_pager_point(page, expected, shot_path):
     return None
 
 
-def _pager_point_for(page, target, shot_path):
-    """返回(点击坐标, 方式)；方式 digit=直接点目标页码，arrow=目标页码不可见时点右侧箭头。"""
+_pager_fit = None       # (slope, intercept, y_css)
+_pager_fit_key = None   # "任务ID|视口宽x高|dpr"
+_pager_task_id = ""
+PAGER_MIN_GAP = 30.0    # 相邻页码间距合理范围（CSS 像素）
+PAGER_MAX_GAP = 60.0
+
+
+def _begin_pager_task(task_id):
+    """任务开始：清空分页缓存并记录任务 ID（缓存 key 的第一段）"""
+    global _pager_task_id, _pager_fit, _pager_fit_key
+    _pager_task_id = str(task_id or "")
+    _pager_fit = None
+    _pager_fit_key = None
+    log(f"分页缓存已清零(任务={_pager_task_id})")
+
+
+def _reset_pager_fit():
+    global _pager_fit, _pager_fit_key
+    _pager_fit = None
+    _pager_fit_key = None
+
+
+def _pager_key(vw, vh, dpr):
+    return f"{_pager_task_id}|{int(vw)}x{int(vh)}|{dpr}"
+
+
+def _longest_run(rows):
+    """按页码连续的最长一段（rows 为 (页码, x, y) 且已按页码排序）"""
+    if not rows:
+        return []
+    best = cur = [rows[0]]
+    for p in rows[1:]:
+        if p[0] == cur[-1][0] + 1:
+            cur.append(p)
+        else:
+            cur = [p]
+        if len(cur) > len(best):
+            best = cur
+    return best
+
+
+def _slope(points):
+    """最小二乘斜率 dx/d页码，点数不足返回 None"""
+    if len(points) < 2:
+        return None
+    dm = sum(p[0] for p in points) / len(points)
+    xm = sum(p[1] for p in points) / len(points)
+    den = sum((p[0] - dm) ** 2 for p in points)
+    if den == 0:
+        return None
+    return sum((p[0] - dm) * (p[1] - xm) for p in points) / den
+
+
+def _cache_pager_fit(rows_css, key):
+    """缓存拟合结果；可用数字点少于 2 或间距不在 30–60px 内一律判定失败"""
+    global _pager_fit, _pager_fit_key
+    run = _longest_run(rows_css)
+    slope = _slope(run) if len(run) >= 2 else None
+    if slope is None:
+        log(f"分页拟合失败：可用连续数字点={len(run)}（需≥2）")
+        return False
+    if not (PAGER_MIN_GAP <= slope <= PAGER_MAX_GAP):
+        log(f"分页拟合失败：页码间距={slope:.1f}px 不在 {PAGER_MIN_GAP:.0f}-{PAGER_MAX_GAP:.0f}px")
+        return False
+    dm = sum(p[0] for p in run) / len(run)
+    xm = sum(p[1] for p in run) / len(run)
+    ym = sum(p[2] for p in run) / len(run)
+    _pager_fit = (slope, xm - slope * dm, ym)
+    _pager_fit_key = key
+    log(f"分页拟合缓存({key}): x={slope:.1f}*页码+{xm - slope * dm:.1f} y={ym:.0f}")
+    return True
+
+
+def _cv2_pager_row(page):
+    """cv2 扫描底部条带的「分页块」行，返回 (row, dpr, vw, vh)。
+    row 元素为 (cx, cy, w, h, 块内部均值亮度)；扫描失败返回 ([], dpr, vw, vh)。"""
+    dpr, vw, vh = 1, 0, 0
     try:
-        page.screenshot(path=shot_path)
+        import numpy as np
+        import cv2
+    except Exception as e:
+        log(f"cv2 不可用: {e}")
+        return [], dpr, vw, vh
+    try:
+        try:
+            vw = page.evaluate("() => window.innerWidth || 0") or 0
+            vh = page.evaluate("() => window.innerHeight || 0") or 0
+            dpr = page.evaluate("() => window.devicePixelRatio || 1") or 1
+        except Exception as e:
+            log(f"cv2 扫描读取视口失败: {e}")
+            return [], dpr, vw, vh
+        im = _shot(page)
+        W, H = im.size
+        y0 = int(H * 0.78)
+        strip = np.array(im.crop((0, y0, W, H)).convert("RGB"))
+        gray = cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []  # (cx, cy, w, h, 内部均值亮度)
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            if not (int(18 * dpr) <= w <= int(90 * dpr)):
+                continue
+            if not (int(14 * dpr) <= h <= int(60 * dpr)):
+                continue
+            if w / h < 0.6 or w / h > 3.5:
+                continue
+            inner = gray[y + h // 4:y + 3 * h // 4, x + w // 4:x + 3 * w // 4]
+            if inner.size == 0:
+                continue
+            boxes.append((x + w / 2, y + h / 2 + y0, w, h, float(inner.mean())))
+        if not boxes:
+            log("cv2 扫描：底部条带未检测到任何分页块")
+            return [], dpr, vw, vh
+        ymed = sorted(b[1] for b in boxes)[len(boxes) // 2]
+        row = [b for b in boxes if abs(b[1] - ymed) <= 6 * dpr]
+        log(f"cv2 扫描：同行候选块 {len(row)} 个，内部亮度 {[round(b[4]) for b in row]}")
+        return row, dpr, vw, vh
+    except Exception as e:
+        log(f"cv2 扫描异常: {e}")
+    return [], dpr, vw, vh
+
+
+def _cv2_next_page_point(page, shot_path=None):
+    """OCR 失败时的回退：在分页器行里找「深色激活块」，取其右侧最近的「浅色页块」中心。
+    仅用于「下一页」场景（当前只被 _turn_pages 调用）。任何校验不通过都返回 None 并记日志。"""
+    row, dpr, vw, vh = _cv2_pager_row(page)
+    if not row:
+        return None
+    dark = [b for b in row if b[4] < 120]
+    if not dark:
+        log("cv2 回退：未找到深色激活块，判定失败")
+        return None
+    if len(dark) > 1:
+        log(f"cv2 回退：检测到 {len(dark)} 个深色块，无法确定激活块，判定失败")
+        return None
+    dx, dy = dark[0][0], dark[0][1]
+    cand = []
+    for b in row:
+        if b[4] <= 200 or b[0] <= dx:
+            continue
+        gap_css = (b[0] - dx) / dpr
+        if PAGER_MIN_GAP <= gap_css <= PAGER_MAX_GAP and abs(b[1] - dy) <= 5 * dpr:
+            cand.append((gap_css, b))
+    if not cand:
+        log("cv2 回退：激活块右侧未找到间距 30-60px 的浅色页块，判定失败")
+        return None
+    cand.sort(key=lambda t: t[0])
+    css_x = cand[0][1][0] / dpr
+    css_y = cand[0][1][1] / dpr
+    if vw and not (0 < css_x < vw * 0.995):
+        log(f"cv2 回退：下一页坐标越界(x={css_x:.0f})，判定失败")
+        return None
+    if vh and not (0 < css_y < vh):
+        log(f"cv2 回退：下一页坐标越界(y={css_y:.0f})，判定失败")
+        return None
+    log(f"cv2 回退命中：激活块 x={dx / dpr:.0f} → 下一页 x={css_x:.0f} y={css_y:.0f}")
+    return (css_x, css_y)
+
+
+def _pager_point_for(page, target, shot_path=None):
+    """返回((x, y), "digit"/"cv2")；定位失败返回 (None, None)。
+
+    分页器由 Flutter canvas 绘制，只能 OCR。数字等间距且位置固定，
+    首屏 OCR 拟合「页码 → x」后按「任务ID+视口宽高+DPR」缓存，后续页直接算坐标。
+    可用数字点少于 2 或间距不在 30–60px 时直接判定失败，不做外推。
+    OCR 失败时回退到 cv2「深色激活块旁的浅色块」定位。
+    """
+    def _fallback():
+        p = _cv2_next_page_point(page, shot_path)
+        return (p, "cv2") if p else (None, None)
+
+    try:
         from PIL import Image
-        im = Image.open(shot_path)
+        try:
+            vw = page.evaluate("() => window.innerWidth || 0") or 0
+            vh = page.evaluate("() => window.innerHeight || 0") or 0
+            dpr = page.evaluate("() => window.devicePixelRatio || 1") or 1
+        except Exception as e:
+            log(f"读取视口尺寸失败，放弃分页缓存: {e}")
+            vw = vh = 0
+            dpr = 1
+        key = _pager_key(vw, vh, dpr) if (vw and vh) else None
+        # 1) 命中缓存：直接算坐标（需通过间距与视口合理性校验）
+        if _pager_fit and _pager_fit_key == key and key:
+            slope, intercept, fy = _pager_fit
+            if not (PAGER_MIN_GAP <= slope <= PAGER_MAX_GAP):
+                log(f"缓存间距异常({slope:.1f}px)，清缓存重新 OCR")
+                _reset_pager_fit()
+            else:
+                fx = slope * target + intercept
+                if 0 < fx < vw * 0.995 and 0 < fy < vh:
+                    return (fx, fy), "digit"
+                log(f"缓存坐标越界(页码{target} x={fx:.0f})，清缓存重新 OCR")
+                _reset_pager_fit()
+        # 2) 缓存未命中：OCR 一次并建立拟合
+        im = _shot(page)
         W, H = im.size
         y0 = int(H * 0.65)
         crop = im.crop((0, y0, W, H))
         scale = 3
         crop = crop.resize((crop.width * scale, crop.height * scale), Image.LANCZOS)
-        crop_path = shot_path + ".crop.png"
-        crop.save(crop_path)
-        res, _ = _get_ocr()(crop_path)
+        _save_debug(crop, shot_path)
+        res, _ = _ocr_img(crop)
         pts = []
         if res:
             for it in res:
@@ -190,50 +409,46 @@ def _pager_point_for(page, target, shot_path):
                     ys = [p[1] for p in box]
                     pts.append((int(t), sum(xs) / len(xs), sum(ys) / len(ys)))
         if len(pts) < 2:
-            log("分页器 OCR 数字不足")
-            return None, None
+            log("分页器 OCR 数字不足（<2），判定定位失败，尝试 cv2 回退")
+            return _fallback()
         ys = sorted(p[2] for p in pts)
         ymed = ys[len(ys) // 2]
         row = sorted(set((p[0], p[1], p[2]) for p in pts if abs(p[2] - ymed) < crop.height * 0.2))
         if len(row) < 2:
-            log("分页行 OCR 数字不足")
-            return None, None
-        hit = next((p for p in row if p[0] == target), None)
-        try:
-            dpr = page.evaluate("() => window.devicePixelRatio || 1")
-        except Exception:
-            dpr = 1
+            log(f"分页行 OCR 数字不足（{len(row)}），判定定位失败，尝试 cv2 回退")
+            return _fallback()
+        rows_css = sorted((d, (x / scale) / dpr, (y0 + y / scale) / dpr) for d, x, y in row)
+        run = _longest_run(rows_css)
+        if len(run) < 2:
+            log(f"可用连续数字点少于 2（{len(run)}），判定定位失败，尝试 cv2 回退")
+            return _fallback()
+        slope = _slope(run)
+        if slope is None or not (PAGER_MIN_GAP <= slope <= PAGER_MAX_GAP):
+            log(f"分页页码间距异常({slope}px)，判定定位失败，尝试 cv2 回退")
+            return _fallback()
+        cy = sum(p[2] for p in rows_css) / len(rows_css)
+        hit = next((p for p in rows_css if p[0] == target), None)
         if hit:
-            return ((hit[1] / scale / dpr), (y0 + hit[2] / scale / dpr)), "digit"
-        # 目标页码未显示：按相邻数字间距外推箭头位置
-        best = [row[0]]
-        cur = [row[0]]
-        for p in row[1:]:
-            if p[0] == cur[-1][0] + 1:
-                cur.append(p)
-            else:
-                if len(cur) > len(best):
-                    best = cur
-                cur = [p]
-        if len(cur) > len(best):
-            best = cur
-        if len(best) < 2:
-            best = row
-        ds = [p[0] for p in best]
-        xs = [p[1] for p in best]
-        spacing = (xs[-1] - xs[0]) / (ds[-1] - ds[0]) if ds[-1] != ds[0] else 0.0
-        if spacing <= 0:
-            log("分页数字间距异常")
-            return None, None
-        cx = max(p[1] for p in row) + spacing
-        cy = sum(p[2] for p in row) / len(row)
-        if cx > crop.width * scale * 0.995:
-            log("下一页箭头超出可视区域")
-            return None, None
-        return ((cx / scale / dpr), (y0 + cy / scale / dpr)), "arrow"
+            fx = hit[1]
+            if vw and not (0 < fx < vw * 0.995):
+                log(f"目标页码 {target} 坐标越界(x={fx:.0f})，判定定位失败，尝试 cv2 回退")
+                return _fallback()
+            if key:
+                _cache_pager_fit(rows_css, key)
+            return (fx, cy), "digit"
+        # 目标页码不在可视窗口：按连续段斜率外推
+        dm = sum(p[0] for p in run) / len(run)
+        xm = sum(p[1] for p in run) / len(run)
+        fx = xm + slope * (target - dm)
+        if vw and not (0 < fx < vw * 0.995):
+            log(f"外推页码 {target} 坐标越界(x={fx:.0f})，判定定位失败，尝试 cv2 回退")
+            return _fallback()
+        if key:
+            _cache_pager_fit(rows_css, key)
+        return (fx, cy), "digit"
     except Exception as e:
-        log(f"定位翻页坐标失败: {e}")
-    return None, None
+        log(f"定位翻页坐标失败: {e}，尝试 cv2 回退")
+        return _fallback()
 
 
 def _kill_port(port):
@@ -1238,6 +1453,282 @@ def _click_next_page(page):
     return False
 
 
+def _safe_url(url):
+    """日志脱敏：去掉 query（token/签名）与 fragment"""
+    try:
+        from urllib.parse import urlparse, urlunparse
+        p = urlparse(url or "")
+        return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+    except Exception:
+        return (url or "").split("?", 1)[0].split("#", 1)[0]
+
+
+def _page_key(url, body):
+    """评价页唯一标识：优先请求 URL 的 pageNum 原始字符串，其次响应 data.pageNum，最后 body md5。
+    不做 offset/页序号换算。"""
+    try:
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(url or "").query)
+        v = q.get("pageNum")
+        if v and str(v[0]).strip():
+            return "url:" + str(v[0]).strip()
+    except Exception as e:
+        log(f"page_key 解析请求 URL 失败，改用响应字段: {e}")
+    try:
+        d = json.loads(body)
+        data = d.get("data") if isinstance(d, dict) else None
+        if isinstance(data, dict) and data.get("pageNum") is not None:
+            return "body:" + str(data.get("pageNum")).strip()
+    except Exception as e:
+        log(f"page_key 解析响应失败，改用 md5 兜底: {e}")
+    return "md5:" + hashlib.md5((body or "").encode("utf-8", "ignore")).hexdigest()
+
+
+def _poi_id_from_url(url):
+    """从请求 URL 取 wmPoiId（评价接口均携带）"""
+    try:
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(url or "").query)
+        for k in ("wmPoiId", "wmPoiIds", "poiId"):
+            v = q.get(k)
+            if v and str(v[0]).strip():
+                return str(v[0]).strip().split(",")[0]
+    except Exception as e:
+        log(f"解析 URL 中的 wmPoiId 失败: {e}")
+    return None
+
+
+def _poi_id_from_data(d):
+    """从响应 data 取 wmPoiId"""
+    data = d.get("data") if isinstance(d, dict) else None
+    if isinstance(data, dict):
+        for k in ("wmPoiId", "poiId", "wm_poi_id"):
+            v = data.get(k)
+            if v not in (None, ""):
+                return str(v)
+    return None
+
+
+def _pager_digits_visible(page):
+    """检测底部分页器是否已渲染：OCR 命中 ≥2 个页码数字，或 cv2 扫描到深色激活块"""
+    try:
+        from PIL import Image
+        im = _shot(page)
+        W, H = im.size
+        crop = im.crop((0, int(H * 0.72), W, H))
+        crop = crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
+        res, _ = _ocr_img(crop)
+        n = 0
+        if res:
+            for it in res:
+                t = (it[1] or "").strip()
+                if t.isdigit() and 1 <= int(t) <= 99:
+                    n += 1
+        if n >= 2:
+            return True
+    except Exception as e:
+        log(f"分页器 OCR 检测异常: {e}")
+    row, _dpr, _vw, _vh = _cv2_pager_row(page)
+    if any(b[4] < 120 for b in row):
+        log("分页器 OCR 未命中，cv2 扫描到深色激活块，判定已渲染")
+        return True
+    return False
+
+
+def _prepare_review_capture(page, shop_name):
+    """注册响应监听 → reload → 打开外卖评价列表 → 等待分页器。
+    返回 capture state；调用方负责 page.remove_listener("response", state["listener"])。"""
+    state = {"captured": [], "urls": [], "keys": set(), "total_pages": 0,
+             "expected_poi": None, "first_checked": False, "shop_checked": False,
+             "abort": False, "listener": None, "failures": []}
+
+    def _on_resp(resp):
+        try:
+            u = resp.url or ""
+            if "comment/list" not in u.lower():
+                return
+            if resp.status != 200:
+                log(f"丢弃响应：HTTP {resp.status}，URL={_safe_url(u)}")
+                return
+            b = resp.text()
+            if not b:
+                log(f"丢弃响应：空响应体，URL={_safe_url(u)}")
+                return
+            try:
+                d = json.loads(b)
+            except Exception as e:
+                log(f"丢弃响应：JSON 解析异常({e})，URL={_safe_url(u)}")
+                return
+            if not isinstance(d, dict):
+                log(f"丢弃响应：响应不是对象({type(d).__name__})，URL={_safe_url(u)}")
+                return
+            data = d.get("data")
+            if not isinstance(data, dict):
+                log(f"丢弃响应：data 不是对象(code={d.get('code')})，URL={_safe_url(u)}")
+                return
+            poi = _poi_id_from_url(u) or _poi_id_from_data(d)
+            if not poi:
+                log(f"丢弃响应：wmPoiId 缺失，URL={_safe_url(u)}")
+                return
+            if not state["first_checked"]:
+                state["first_checked"] = True
+                state["expected_poi"] = poi
+                log(f"首条响应锁定期望 poi={poi}")
+                try:
+                    total = int(data.get("total") or 0)
+                    ps = int(data.get("pageSize") or 0)
+                    if total and ps:
+                        state["total_pages"] = (total + ps - 1) // ps
+                        log(f"总条数={total} 每页={ps} 总页数={state['total_pages']}")
+                except Exception as e:
+                    log(f"总页数计算失败: {e}")
+            elif poi != state["expected_poi"]:
+                log(f"丢弃响应：wmPoiId 不符 期望={state['expected_poi']} 实际={poi}，URL={_safe_url(u)}")
+                return
+            key = _page_key(u, b)
+            if key not in state["keys"]:
+                state["keys"].add(key)
+                state["captured"].append(b)
+                state["urls"].append(u)
+                log(f"接受响应：key={key} 累计 {len(state['keys'])} 页")
+            else:
+                log(f"响应重复：key={key}，不重复计入")
+        except Exception as e:
+            log(f"处理评价响应异常: {e}")
+
+    state["listener"] = _on_resp
+    page.on("response", _on_resp)
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=20000)
+    except Exception as e:
+        log(f"重新加载评价页失败: {e}")
+        state["failures"].append("reload_failed")
+
+    # reload 后先软等 3 秒；没有响应就先打开评价列表，再等 15 秒（超时计入失败）
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if state["captured"] or state["abort"]:
+            break
+        page.wait_for_timeout(300)
+    if not state["captured"] and not state["abort"]:
+        log("reload 后 3 秒内未收到 comment/list 响应，先打开外卖评价列表继续等待")
+
+    before = len(state["captured"])
+    _open_review_list_tab(page)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if len(state["captured"]) > before or state["abort"]:
+            break
+        page.wait_for_timeout(300)
+    if len(state["captured"]) <= before and not state["abort"]:
+        log("打开外卖评价列表后 15 秒内未收到 comment/list 响应，计入本次失败")
+        state["failures"].append("no_first_response")
+
+    # DOM 店名校验：仅在拿到首条响应后执行一次，之后只用 wmPoiId 比对
+    if state["expected_poi"] and not state["shop_checked"] and not state["abort"]:
+        state["shop_checked"] = True
+        dom_name = None
+        try:
+            dom_name = _extract_top_shop_name_from_dom(page, require_anchored=True)
+        except Exception as e:
+            log(f"首条响应读取 DOM 店名异常: {e}")
+        if dom_name and shop_name and not _shop_names_match(dom_name, shop_name):
+            log(f"首条响应 DOM 店名不匹配 目标={shop_name} 实际={dom_name}，终止本次抓取")
+            state["abort"] = True
+            state["captured"].clear()
+            state["urls"].clear()
+            state["keys"].clear()
+        elif not dom_name:
+            log("首条响应 DOM 店名不可读，沿用切换时的校验结果")
+        else:
+            log(f"首条响应 DOM 店名校验通过：{dom_name}")
+
+    try:
+        page.keyboard.press("End")
+    except Exception as e:
+        log(f"滚动到底部失败: {e}")
+    deadline = time.time() + 15
+    visible = False
+    while time.time() < deadline:
+        if _pager_digits_visible(page):
+            visible = True
+            break
+        page.wait_for_timeout(300)
+    if not visible:
+        log("15 秒内未检测到分页器，翻页可能失败")
+        state["failures"].append("pager_not_visible")
+    if _DEBUG_SHOTS:
+        try:
+            _dbg_dir2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "debug", "review_dump")
+            os.makedirs(_dbg_dir2, exist_ok=True)
+            page.screenshot(path=os.path.join(_dbg_dir2, "reviews_page.png"), full_page=True)
+            log(f"评价页当前 URL: {_safe_url(page.url)}")
+        except Exception as e:
+            log(f"截图调试失败: {e}")
+    return state
+
+
+def _wait_for_new_key(page, keys, before_count, timeout_ms=20000):
+    """等待新页 key 出现，每 250ms 轮询，超时返回 False"""
+    waited = 0
+    while waited < timeout_ms:
+        if len(keys) > before_count:
+            return True
+        page.wait_for_timeout(250)
+        waited += 250
+    return len(keys) > before_count
+
+
+def _turn_pages(page, state, shop_name, shot_path):
+    """翻页直到覆盖总页数（或到 200 页上限）。返回已捕获页数。"""
+    keys = state["keys"]
+    total = state["total_pages"]
+    no_new = 0
+    while len(keys) < total and len(keys) < 200:
+        if state["abort"]:
+            log("捕获已中止，停止翻页")
+            break
+        target = len(keys) + 1
+        ok = False
+        for attempt in range(5):
+            if attempt:
+                backoff = min(1.5 * attempt, 4.5)
+                log(f"第 {target} 页重试 {attempt}/4，退避 {backoff}s")
+                page.wait_for_timeout(int(backoff * 1000))
+            before = len(keys)
+            pt, _mode = _pager_point_for(page, target, shot_path)
+            if not pt:
+                log(f"未能定位第 {target} 页（尝试 {attempt + 1}/5），计入失败")
+                no_new += 1
+                if no_new >= 2:
+                    log("连续 2 次无新页，清空分页缓存并重新 OCR")
+                    _reset_pager_fit()
+                    no_new = 0
+                continue
+            log(f"点击页码 {target} 坐标=({pt[0]:.0f},{pt[1]:.0f})")
+            try:
+                page.mouse.click(pt[0], pt[1])
+            except Exception as e:
+                log(f"点击第 {target} 页失败: {e}")
+                no_new += 1
+                continue
+            if _wait_for_new_key(page, keys, before, 20000):
+                ok = True
+                no_new = 0
+                log(f"翻页成功，已捕获 {len(keys)}/{total} 页")
+                break
+            no_new += 1
+            log(f"点击后 20 秒内无新页（连续 {no_new} 次），已捕获 {len(keys)}/{total} 页")
+            if no_new >= 2:
+                log("连续 2 次点击无新页，清空分页缓存并重新 OCR")
+                _reset_pager_fit()
+                no_new = 0
+        if not ok:
+            log(f"第 {target} 页重试 4 次仍无新页，终止翻页")
+            break
+    return len(keys)
+
+
 def cmd_scrape_reviews(args):
     """抓取指定店铺的全部评价（通过监听评价接口响应 + 翻页）"""
     page = _ensure_logged_in_page()
@@ -1261,212 +1752,86 @@ def cmd_scrape_reviews(args):
     if not _click_text_deep_retry(page, "顾客评价"):
         # 有的后台菜单文案不同，尝试「评价管理」
         _click_text_deep_retry(page, "评价管理")
-    time.sleep(3)
+    page.wait_for_timeout(300)
 
-    captured = []
-    captured_urls = []
-    list_url = None  # 评价列表接口的完整 URL（含签名 token）
-
-    def _on_resp(resp):
-        nonlocal list_url
-        try:
-            u = resp.url.lower()
-            if "comment/list" in u:
-                b = resp.text()
-                if b and len(b) > 50 and "403 Forbidden" not in b:
-                    captured.append(b)
-                    captured_urls.append(resp.url)
-                    if list_url is None:
-                        list_url = resp.url
-        except Exception:
-            pass
-
-    page.on("response", _on_resp)
-    # 丢弃 reload 前的旧页码响应，避免起点不是第 1 页
-    captured.clear()
-    captured_urls.clear()
-    list_url = None
-    try:
-        page.reload(wait_until="domcontentloaded", timeout=20000)
-    except Exception:
-        pass
-    time.sleep(3)
-    # reload 会回到默认「综合评分明细」标签，必须点「外卖评价列表」才有 comment/list
-    _open_review_list_tab(page)
-    time.sleep(3)
-    try:
-        _dbg_dir2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "debug", "review_dump")
-        os.makedirs(_dbg_dir2, exist_ok=True)
-        page.screenshot(path=os.path.join(_dbg_dir2, "reviews_page.png"), full_page=True)
-        log(f"评价页当前 URL: {page.url}")
-        # 探测页码文本是否可被定位
-        for _t in ("2", "下一页", "3"):
-            try:
-                _n = page.get_by_text(_t, exact=True).count()
-                log(f"  定位文本 '{_t}' 命中数={_n}")
-            except Exception as _e:
-                log(f"  定位文本 '{_t}' 异常: {_e}")
-    except Exception as _e:
-        log(f"截图调试失败: {_e}")
-
-    # 美团评价页是 Flutter Web，文本画在 canvas 上，Playwright 定位不到页码。
-    # 改用 OCR：截图 → 找到底部分页器上"下一页"数字的坐标 → 点击。
-    # 用户实测规律：点完 2 后 3 会补到 2 的位置，故逐页 OCR 定位点击即可翻完全部页。
+    task_id = f"{shop_name or 'current'}-{int(time.time())}"
+    _begin_pager_task(task_id)
     shot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "debug", "_ocr_shot.png")
-    # 先滚到底，确保分页器在视口内
-    try:
-        page.keyboard.press("End")
-    except Exception:
-        pass
-    time.sleep(1)
 
-    # 从第一页响应解析总条数 → 总页数
-    total_pages = 0
-    if captured:
+    def _capture_once(attempt_no):
+        log(f"开始第 {attempt_no + 1} 次评价抓取")
+        state = _prepare_review_capture(page, shop_name)
         try:
-            d0 = json.loads(captured[0])
-            t = d0.get("data") if isinstance(d0, dict) else None
-            if isinstance(t, dict):
-                total = t.get("total") or 0
-                ps = t.get("pageSize") or 10
-                if total and ps:
-                    total_pages = (int(total) + int(ps) - 1) // int(ps)
-        except Exception:
-            pass
-    log(f"评价总页数估算: {total_pages}")
+            if state["abort"]:
+                log("首条响应店名校验失败，跳过翻页")
+                fetched = 0
+            else:
+                fetched = _turn_pages(page, state, shop_name, shot_path)
+        finally:
+            try:
+                page.remove_listener("response", state["listener"])
+            except Exception as e:
+                log(f"摘除响应监听失败: {e}")
+        return state, fetched
 
-    # 分页器会同时显示 1..12，固定坐标连点会重复命中旧页码，改为每页重新定位目标页码。
-    def _req_page_no(u):
-        try:
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(u).query)
-            v = q.get("pageNum")
-            if v:
-                return int(v[0])
-        except Exception:
-            pass
-        return None
-
-    def _body_page_no(body):
-        try:
-            d = json.loads(body)
-            data = d.get("data") if isinstance(d, dict) else None
-            if isinstance(data, dict):
-                pn = data.get("pageNum")
-                ps = data.get("pageSize") or 0
-                # 响应里的 pageNum 常是 offset（如 15 页时返回 140）
-                if isinstance(pn, int) and isinstance(ps, int) and ps > 0 and pn >= ps:
-                    return pn // ps + 1
-                if isinstance(pn, int) and 0 < pn <= 999:
-                    return pn
-        except Exception:
-            pass
-        return None
-
-    pages_seen = set()
-
-    def _refresh_pages():
-        for i, u in enumerate(captured_urls):
-            p = _req_page_no(u)
-            if p is None and i < len(captured):
-                p = _body_page_no(captured[i])
-            if p:
-                if total_pages and p > total_pages:
-                    continue
-                pages_seen.add(p)
-
-    _refresh_pages()
-    log(f"初始已捕获页码: {sorted(pages_seen)}")
-
-    stalls = 0
-    max_loops = (total_pages + 3) if total_pages else 30
-    for step in range(max_loops):
-        _refresh_pages()
-        cur = max(pages_seen) if pages_seen else 1
-        if total_pages and cur >= total_pages:
-            log(f"已抓取全部 {total_pages} 页，停止翻页")
-            break
-        target = cur + 1
-        before_pages = set(pages_seen)
-        before_cnt = len(captured)
-        pt, mode = _pager_point_for(page, target, shot_path)
-        if not pt:
-            log(f"未能定位第 {target} 页的点击位置，结束翻页")
-            break
-        label = f"页码 {target}" if mode == "digit" else f"下一页箭头(第{target}页不可见)"
-        log(f"点击{label} 坐标=({pt[0]:.0f},{pt[1]:.0f})，当前已捕获页码={sorted(pages_seen)}")
-        try:
-            page.mouse.click(pt[0], pt[1])
-        except Exception as e:
-            log(f"点击失败: {e}")
-            break
-        waited = 0
-        while waited < 12 and len(captured) == before_cnt:
-            page.wait_for_timeout(500)
-            waited += 1
-        _refresh_pages()
-        if len(captured) == before_cnt or not (pages_seen - before_pages):
-            stalls += 1
-            log(f"本次点击未出现新页码(连续 {stalls} 次)，已捕获={sorted(pages_seen)}")
-            if stalls >= 2:
-                log("连续两次翻页无新数据，停止")
-                break
-        else:
-            stalls = 0
-            log(f"翻页成功，已捕获页码={sorted(pages_seen)}，响应数={len(captured)}")
-
-    try:
-        page.remove_listener("response", _on_resp)
-    except Exception:
-        pass
+    state, pages_fetched = _capture_once(0)
+    pages_expected = state["total_pages"]
+    complete = pages_expected > 0 and pages_fetched >= pages_expected
+    if state["abort"]:
+        _send_shop_not_found(shop_name, shop_name, "CAPTURE_SHOP_MISMATCH")
+        return
+    if not complete:
+        log(f"第 1 次抓取不完整（{pages_fetched}/{pages_expected or '未知'} 页），重新进入评价页重试 1 次")
+        state, pages_fetched = _capture_once(1)
+        pages_expected = state["total_pages"]
+        complete = pages_expected > 0 and pages_fetched >= pages_expected
+        if state["abort"]:
+            _send_shop_not_found(shop_name, shop_name, "CAPTURE_SHOP_MISMATCH")
+            return
+    if not complete:
+        log(f"重试后仍不完整：pagesFetched={pages_fetched} pagesExpected={pages_expected}，本次标记为部分数据")
 
     reviews = []
     seen = set()
-    import json as _json
-    # 调试目录
-    try:
-        _dbg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "debug", "review_dump")
-        os.makedirs(_dbg_dir, exist_ok=True)
-    except Exception:
-        _dbg_dir = None
-    best_idx = -1
-    best_len = 0
     total_seen = 0
-    for idx, body in enumerate(captured):
+    for idx, body in enumerate(state["captured"]):
         n_here = 0
         try:
-            data = _json.loads(body)
-        except Exception:
-            data = None
-        if data is not None:
-            rs, tot = _extract_reviews_from_json(data)
-            total_seen += tot
-            for r in rs:
-                n_here += 1
-                key = r["platformReviewId"] or (r["reviewer"], r["content"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                reviews.append(r)
-        url = captured_urls[idx] if idx < len(captured_urls) else ""
-        log(f"  响应[{idx}] 解析评价={n_here} 长度={len(body)} URL={url[:110]}")
-        if len(body) > best_len:
-            best_len = len(body)
-            best_idx = idx
-    # 保存最大的那条评价列表响应样本，供核对字段结构
-    if _dbg_dir and best_idx >= 0:
+            data = json.loads(body)
+        except Exception as e:
+            log(f"  响应[{idx}] JSON 解析失败({e})，跳过该响应")
+            continue
+        rs, tot = _extract_reviews_from_json(data)
+        total_seen += tot
+        for r in rs:
+            n_here += 1
+            key = r["platformReviewId"] or (r["reviewer"], r["content"])
+            if key in seen:
+                log(f"  响应[{idx}] 跳过重复评价 key={key}")
+                continue
+            seen.add(key)
+            reviews.append(r)
+        url = state["urls"][idx] if idx < len(state["urls"]) else ""
+        log(f"  响应[{idx}] 解析评价={n_here} 长度={len(body)} URL={_safe_url(url)}")
+
+    if _DEBUG_SHOTS and state["captured"]:
+        best_idx = max(range(len(state["captured"])), key=lambda i: len(state["captured"][i]))
         try:
+            _dbg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "debug", "review_dump")
+            os.makedirs(_dbg_dir, exist_ok=True)
             with open(os.path.join(_dbg_dir, "list_sample.json"), "w", encoding="utf-8") as f:
-                f.write(captured_urls[best_idx] + "\n" + captured[best_idx])
-        except Exception:
-            pass
+                f.write(state["urls"][best_idx] + "\n" + state["captured"][best_idx])
+        except Exception as e:
+            log(f"保存评价列表样本失败: {e}")
 
     saved = len(reviews)
     skipped = max(0, total_seen - saved)
-    log(f"评价抓取完成：店铺={shop_name or '(当前)'}，接口响应={len(captured)} 条，"
+    log(f"评价抓取完成：店铺={shop_name or '(当前)'}，完整={complete} "
+        f"页数={pages_fetched}/{pages_expected}，接口响应={len(state['captured'])} 条，"
         f"总评价={total_seen}，有文字已记录={saved}，无文字未记录={skipped}")
     send({"type": "reviews_fetched", "reviews": reviews, "count": saved,
-          "total": total_seen, "skipped": skipped, "shopName": shop_name})
+          "total": total_seen, "skipped": skipped, "shopName": shop_name,
+          "complete": complete, "pagesExpected": pages_expected, "pagesFetched": pages_fetched})
 
 
 def cmd_run_appeal(args):
@@ -1496,7 +1861,8 @@ def cmd_run_appeal(args):
         time.sleep(1)
         _click_text(page, "顾客评价")
         time.sleep(3)
-        page.screenshot(path="data/debug/appeal_step_reviews.png")
+        if _DEBUG_SHOTS:
+            page.screenshot(path="data/debug/appeal_step_reviews.png")
         log("已进入评价列表页")
 
         # 3. 点击该条评价的"申诉"入口 → 打开「选择申诉类型」页
@@ -1509,7 +1875,8 @@ def cmd_run_appeal(args):
                 appeal_loc.first.click(timeout=4000)
                 appealed = True
                 time.sleep(2)
-                page.screenshot(path="data/debug/appeal_step1_type.png")
+                if _DEBUG_SHOTS:
+                    page.screenshot(path="data/debug/appeal_step1_type.png")
                 log("已点击申诉，进入选择申诉类型页")
             except Exception as e:
                 log(f"点击申诉失败: {e}")
@@ -1529,7 +1896,8 @@ def cmd_run_appeal(args):
             time.sleep(0.5)
             _click_text(page, "下一步", exact=False, timeout=4000)
             time.sleep(2)
-            page.screenshot(path="data/debug/appeal_step2_detail.png")
+            if _DEBUG_SHOTS:
+                page.screenshot(path="data/debug/appeal_step2_detail.png")
             log("已进入评价申诉详情页")
         except Exception as e:
             log(f"选择类型/下一步失败: {e}")
@@ -1577,14 +1945,16 @@ def cmd_run_appeal(args):
             except Exception as e:
                 log(f"上传图片失败(跳过): {e}")
 
-        page.screenshot(path="data/debug/appeal_step3_filled.png")
+        if _DEBUG_SHOTS:
+            page.screenshot(path="data/debug/appeal_step3_filled.png")
 
         # 7. 点击「提交」
         submitted = _click_text(page, "提交", exact=False, timeout=4000)
         if submitted:
             log("已点击提交")
             time.sleep(2)
-        page.screenshot(path="data/debug/appeal_step4_done.png")
+        if _DEBUG_SHOTS:
+            page.screenshot(path="data/debug/appeal_step4_done.png")
 
         send({
             "type": "appeal_done",
@@ -1601,8 +1971,9 @@ def cmd_run_appeal(args):
 def _ocr_page_text(page, shot_path):
     """截图并 OCR 返回整页文本（美团页面为 Flutter canvas，DOM 无文本时兜底）"""
     try:
-        page.screenshot(path=shot_path, full_page=False)
-        result, _ = _get_ocr()(shot_path)
+        im = _shot(page)
+        _save_debug(im, shot_path)
+        result, _ = _ocr_img(im)
         if not result:
             return ""
         return "\n".join(str(item[1]) for item in result)
@@ -1801,7 +2172,8 @@ def cmd_scrape_negative(args):
     dbg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "debug", "negative_dump")
     try:
         os.makedirs(dbg_dir, exist_ok=True)
-        page.screenshot(path=os.path.join(dbg_dir, "negative_page.png"), full_page=True)
+        if _DEBUG_SHOTS:
+            page.screenshot(path=os.path.join(dbg_dir, "negative_page.png"), full_page=True)
         log(f"负反馈页 URL: {page.url} 进入={entered}")
     except Exception as e:
         dbg_dir = None
@@ -2159,8 +2531,9 @@ _REPLY_DBG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", 
 
 def _ocr_boxes(page, shot_path):
     """截屏 OCR，返回 [(text, cx, cy)]（CSS 像素坐标）"""
-    page.screenshot(path=shot_path)
-    res, _ = _get_ocr()(shot_path)
+    im = _shot(page)
+    _save_debug(im, shot_path)
+    res, _ = _ocr_img(im)
     out = []
     if not res:
         log(f"OCR无结果 shot={shot_path}")
@@ -2274,21 +2647,14 @@ def _ocr_zone(page, tag, x_frac0=0.0, y_frac0=0.0, scale=3):
     """截屏并裁剪 (x_frac0,y_frac0)-右下角区域，LANCZOS 放大 scale 倍后 OCR。
     评价卡片由 Flutter canvas 绘制，12px 小字不放大识别不出。返回 [(text, cx, cy)]（页面 CSS 像素）"""
     try:
-        os.makedirs(_REPLY_DBG_DIR, exist_ok=True)
-    except Exception:
-        pass
-    shot = os.path.join(_REPLY_DBG_DIR, f"zone_{tag}.png")
-    try:
-        page.screenshot(path=shot)
         from PIL import Image
-        im = Image.open(shot)
+        im = _shot(page)
         W, H = im.size
         x0, y0 = int(W * x_frac0), int(H * y_frac0)
         crop = im.crop((x0, y0, W, H))
         crop = crop.resize((crop.width * scale, crop.height * scale), Image.LANCZOS)
-        cp = os.path.join(_REPLY_DBG_DIR, f"zone_{tag}_crop.png")
-        crop.save(cp)
-        res, _ = _get_ocr()(cp)
+        _save_debug(crop, os.path.join(_REPLY_DBG_DIR, f"zone_{tag}.png"))
+        res, _ = _ocr_img(crop)
     except Exception as e:
         log(f"OCR区域识别异常({tag}): {e}")
         return []
@@ -2425,13 +2791,14 @@ def _click_reply_button_for(page, review, k):
     OCR 读不出内容时退化为第 k 个可见按钮（仅未滚动的首屏有效）。
     返回 (是否已点开编辑器, None)"""
     key = ((review.get("content") or "").strip())[:10]
-    # 0) 清理可能残留的旧编辑器，避免把旧编辑器误判为本目标已点开
+    # 0) 清理可能残留的旧编辑器：先用 DOM 判断是否真的开着，避免每次都盲跑一次 OCR
     try:
-        st = _editor_open_pos(page, "stale")
-        if st:
-            page.mouse.click(st["cancel"][0], st["cancel"][1])
-            page.wait_for_timeout(800)
-            log("已关闭残留编辑器")
+        if _flutter_editor_rect(page):
+            st = _editor_open_pos(page, "stale")
+            if st:
+                page.mouse.click(st["cancel"][0], st["cancel"][1])
+                page.wait_for_timeout(800)
+                log("已关闭残留编辑器")
     except Exception:
         pass
     btn = None
@@ -2513,7 +2880,8 @@ def _click_reply_button_for(page, review, k):
         page.mouse.up()
         for _ in range(4):
             page.wait_for_timeout(700)
-            if _editor_open_pos(page, "opened") or _flutter_editor_rect(page):
+            # DOM 优先：编辑器打开时引擎必有 flt-text-editing textarea，命中即成功，免 OCR
+            if _flutter_editor_rect(page) or _editor_open_pos(page, "opened"):
                 log(f"已点开「回复」编辑器(k={k} 点击=({bx + dx},{by + dy}))")
                 return True, None
         page.keyboard.press("Escape")
@@ -2551,10 +2919,11 @@ def _rpa_reply_one(page, reply_events, text, card_eh=None, expect_pid=None):
         page.mouse.wheel(0, max(over, 120))
         page.wait_for_timeout(900)
     if not ta:
-        try:
-            page.screenshot(path=os.path.join(_REPLY_DBG_DIR, "editor_fail.png"))
-        except Exception:
-            pass
+        if _DEBUG_SHOTS:
+            try:
+                page.screenshot(path=os.path.join(_REPLY_DBG_DIR, "editor_fail.png"))
+            except Exception:
+                pass
         return False, "点击回复后编辑器未出现(未检到编辑态textarea)"
     # 2) 建立键盘焦点并键入。焦点优先用 Playwright locator 点击编辑态 textarea
     # （穿透 shadowRoot + 点击前实时解析位置），坐标点击兜底；焦点确认以
@@ -2620,7 +2989,8 @@ def _rpa_reply_one(page, reply_events, text, card_eh=None, expect_pid=None):
         else:
             _js_set_editor_text(text)
         page.wait_for_timeout(800)
-        # 诊断：textarea DOM 真实值码点（确认键入内容是否真实中文，联调后移除）
+        # 3) 键入校验：优先读编辑态 textarea 的 DOM 真实值（与 N/300 计数器等价，免一次 OCR）
+        dv_val = None
         try:
             for fr in page.frames:
                 dv = fr.evaluate("""() => {
@@ -2634,28 +3004,36 @@ def _rpa_reply_one(page, reply_events, text, card_eh=None, expect_pid=None):
                     return null;
                 }""")
                 if dv is not None:
-                    log("textarea值码点: " + " ".join(hex(ord(c)) for c in dv[:36]))
+                    dv_val = dv
                     break
         except Exception:
             pass
-        # 3) 键入校验：计数器 N/300（N>0）且编辑区无 '???' 乱码，失败重试
-        boxes = _ocr_zone(page, f"cnt{rnd}", x_frac0=0.25, y_frac0=0.2)
-        has_cnt = False
-        bad_chars = False
-        for t, x, y in boxes:
-            if _re3.match(r"^\d+/300$", t) and not t.startswith("0/"):
-                has_cnt = True
-            if t.count("?") >= 3:
-                bad_chars = True
-        ok_typed = has_cnt and not bad_chars
+        if dv_val is not None:
+            bad_chars = dv_val.count("?") >= 3
+            ok_typed = dv_val.strip() == text.strip()
+            has_cnt = ok_typed
+            if _DEBUG_SHOTS:
+                log("textarea值码点: " + " ".join(hex(ord(c)) for c in dv_val[:36]))
+        else:
+            # DOM 读不到时才退回 OCR 计数器校验
+            boxes = _ocr_zone(page, f"cnt{rnd}", x_frac0=0.25, y_frac0=0.2)
+            has_cnt = False
+            bad_chars = False
+            for t, x, y in boxes:
+                if _re3.match(r"^\d+/300$", t) and not t.startswith("0/"):
+                    has_cnt = True
+                if t.count("?") >= 3:
+                    bad_chars = True
+            ok_typed = has_cnt and not bad_chars
         if ok_typed:
             break
         log(f"键入校验未通过(rnd={rnd} 计数器={has_cnt} 乱码={bad_chars})")
     if not ok_typed:
-        try:
-            page.screenshot(path=os.path.join(_REPLY_DBG_DIR, "typing_fail.png"))
-        except Exception:
-            pass
+        if _DEBUG_SHOTS:
+            try:
+                page.screenshot(path=os.path.join(_REPLY_DBG_DIR, "typing_fail.png"))
+            except Exception:
+                pass
         return False, "回复内容键入失败（N/300 计数器未变化）"
     # 4) 提交：编辑器底部「取消+回复」按钮排（回复在最右）。用「取消」锚定同一排
     # （卡片列表没有「取消」，编辑器按钮排必有），避免误点卡片里同名的「回复」按钮
