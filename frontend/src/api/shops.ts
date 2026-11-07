@@ -18,6 +18,10 @@ export const shopsApi = {
     return request.put(`/shops/${id}`, data)
   },
 
+  forceDeleteShop(id: number, password: string): Promise<void> {
+    return request.post(`/shops/${id}/force-delete`, { password })
+  },
+
   deleteShop(id: number): Promise<void> {
     return request.delete(`/shops/${id}`)
   },

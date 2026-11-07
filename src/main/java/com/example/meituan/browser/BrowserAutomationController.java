@@ -136,10 +136,31 @@ public class BrowserAutomationController {
                 shopType = shopList.size() >= 2 ? "服务商用户" : "美团单店";
             }
 
+            // Re-read platform state before writing; client-provided status alone is insufficient.
+            Map<String, Object> fresh = browserService.scrapeShops();
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> eligible = (List<Map<String, Object>>) fresh.get("shops");
+            Map<String, String> platformIds = new HashMap<>();
+            for (Map<String, Object> item : shopList) {
+                String poiId = String.valueOf(item.getOrDefault("poiId", ""));
+                if (!Set.of("营业中", "休息中").contains(String.valueOf(item.get("businessStatus"))) || !poiId.matches("[0-9]+")) {
+                    return ResponseEntity.badRequest().body(Map.of("success", false, "message", "仅允许绑定具有真实店铺ID且营业中或休息中的门店，请重新读取店铺列表"));
+                }
+                boolean verified = eligible.stream().anyMatch(row -> poiId.equals(row.get("poiId"))
+                        && item.get("name").equals(row.get("name")) && Set.of("营业中", "休息中").contains(String.valueOf(row.get("businessStatus"))));
+                if (!verified) return ResponseEntity.badRequest().body(Map.of("success", false, "message", "门店状态已变化，请重新读取店铺列表"));
+                platformIds.put(String.valueOf(item.get("name")).trim(), poiId);
+            }
+
             // 查重：该用户已绑定的店铺名集合，重复绑定直接跳过
             Set<String> existing = new HashSet<>();
             for (Shop s : shopRepository.findByUserId(user.getId())) {
                 existing.add(s.getName() == null ? "" : s.getName().trim());
+                String matchingId = platformIds.get(s.getName() == null ? "" : s.getName().trim());
+                if (matchingId != null && (s.getPoiId() == null || s.getPoiId().isBlank())) {
+                    s.setPoiId(matchingId);
+                    shopRepository.save(s);
+                }
             }
 
             List<String> toBind = new ArrayList<>();
@@ -173,6 +194,7 @@ public class BrowserAutomationController {
                     shop.setMeituanAccount(meituanAccount);
                     shop.setShopType(shopType);
                     shop.setUserId(user.getId());
+                    shop.setPoiId(platformIds.get(shopName));
                     shopService.createShop(shop);
                     bound++;
                 } catch (Exception ex) {

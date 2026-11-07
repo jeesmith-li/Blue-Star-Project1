@@ -148,6 +148,8 @@ public class ReplyExecutionService {
         try {
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("platformReviewId", r.getPlatformReviewId());
+            item.put("rating", r.getRating());
+            item.put("content", r.getContent());
             item.put("replyText", content);
             try {
                 JsonNode respNode = browserService.replyReviews(shop.getName(), List.of(item));
@@ -248,6 +250,8 @@ public class ReplyExecutionService {
                     : String.valueOf(pick.templateName());
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("platformReviewId", r.getPlatformReviewId());
+            item.put("rating", r.getRating());
+            item.put("content", r.getContent());
             item.put("replyText", tpl);
             items.add(item);
             idToReview.put(r.getPlatformReviewId(), r);

@@ -144,9 +144,9 @@ public class FoodSafetyController {
             String orderNo = String.valueOf(request.getOrDefault("orderNo", ""));
             String reason = String.valueOf(request.getOrDefault("reason", ""));
             String templateMark = String.valueOf(request.getOrDefault("templateMark", ""));
-            if (reason.trim().length() < 20) {
+            if (reason.trim().length() < 20 || reason.trim().length() > 300) {
                 response.put("success", false);
-                response.put("message", "申诉理由需大于20字（美团要求）");
+                response.put("message", "食安申诉理由须为20至300字");
                 return ResponseEntity.ok(response);
             }
             response.putAll(foodSafetyService.manualAppeal(shopId, orderNo, reason.trim(), templateMark, username));

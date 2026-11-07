@@ -144,8 +144,7 @@ instance.interceptors.response.use(
           router.push('/login')
           break
         case 403:
-          ElMessage.error('无权限访问')
-          router.push('/forbidden')
+          ElMessage.error((error.response.data as { message?: string })?.message || '无权执行此操作')
           break
         case 404:
           ElMessage.error('请求的资源不存在')

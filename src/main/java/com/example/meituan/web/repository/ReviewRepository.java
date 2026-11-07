@@ -18,6 +18,8 @@ public interface ReviewRepository extends JpaRepository<Review, Long>, JpaSpecif
 
     Page<Review> findByShopIdAndReplyStatusAndRating(Long shopId, String replyStatus, Integer rating, Pageable pageable);
 
+    void deleteByShopId(Long shopId);
+
     long countByShopId(Long shopId);
 
     long countByShopIdAndReplyStatus(Long shopId, String replyStatus);

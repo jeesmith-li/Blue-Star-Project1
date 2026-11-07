@@ -171,7 +171,9 @@ public class BrowserAutomationService {
                     shops.add(Map.of(
                             "id", s.path("id").asText(),
                             "name", s.path("name").asText(),
-                            "source", s.path("source").asText("meituan")
+                            "source", s.path("source").asText("meituan"),
+                            "poiId", s.path("poiId").asText(),
+                            "businessStatus", s.path("businessStatus").asText()
                     ));
                 }
             }

@@ -280,4 +280,33 @@ public class ShopController {
             return ResponseEntity.status(500).body(response);
         }
     }
+    @Autowired
+    private org.springframework.security.crypto.password.PasswordEncoder passwordEncoder;
+
+    @PostMapping("/shops/{id}/force-delete")
+    public ResponseEntity<Map<String, Object>> forceDeleteShop(
+            @PathVariable Long id,
+            @RequestBody Map<String, String> body,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+        User user;
+        try {
+            String token = jwtUtil.extractTokenFromHeader(authHeader);
+            user = authService.getCurrentUser(jwtUtil.extractUsername(token));
+            if (user == null) throw new IllegalArgumentException();
+        } catch (Exception e) {
+            return ResponseEntity.status(401).body(Map.of("message", "请重新登录"));
+        }
+        Shop shop = shopService.getShopById(id);
+        if (shop == null) return ResponseEntity.status(404).body(Map.of("message", "店铺不存在"));
+        if (!shop.getUserId().equals(user.getId()) && user.getRole() != User.UserRole.ADMIN) {
+            return ResponseEntity.status(403).body(Map.of("message", "无权删除该店铺"));
+        }
+        String password = body.get("password");
+        if (password == null || password.isBlank() || !passwordEncoder.matches(password, user.getPassword())) {
+            return ResponseEntity.status(400).body(Map.of("message", "当前登录用户密码错误"));
+        }
+        shopService.forceDeleteShop(id);
+        return ResponseEntity.ok(Map.of("success", true, "message", "店铺及关联评价、申诉和反馈已删除"));
+    }
+
 }

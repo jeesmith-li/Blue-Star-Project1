@@ -1,5 +1,6 @@
 export interface Shop {
   id: number
+  poiId?: string
   name: string
   meituanAccount: string
   shopType: string

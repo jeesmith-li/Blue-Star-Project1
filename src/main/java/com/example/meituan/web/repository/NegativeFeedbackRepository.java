@@ -16,5 +16,7 @@ public interface NegativeFeedbackRepository extends JpaRepository<NegativeFeedba
 
     Optional<NegativeFeedback> findByShopIdAndOrderNoAndChannelName(Long shopId, String orderNo, String channelName);
 
+    void deleteByShopId(Long shopId);
+
     long countByShopId(Long shopId);
 }

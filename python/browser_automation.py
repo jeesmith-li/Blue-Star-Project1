@@ -27,6 +27,7 @@ REVIEW_PAGE_URL = "https://e.waimai.meituan.com/#https://waimaieapp.meituan.com/
 # 全局缓存：浏览器加载时捕获的 poiList 完整 URL（含签名参数）
 _poi_list_url = None
 _poi_list_body = None
+_poi_capture_subscription = None
 
 _chrome_proc = None
 _browser = None
@@ -393,6 +394,30 @@ def _pager_point_for(page, target, shot_path=None):
         # 2) 缓存未命中：OCR 一次并建立拟合
         im = _shot(page)
         W, H = im.size
+        # Flutter canvas page digits may be invisible to OCR. Identify the
+        # active dark square and its adjacent light square in the footer.
+        import cv2
+        import numpy as np
+        footer_y = max(0, H - 160)
+        footer = np.array(im.convert("RGB"))[footer_y:]
+        dark = cv2.inRange(footer, (25, 25, 25), (45, 45, 45))
+        light = cv2.inRange(footer, (242, 242, 242), (244, 244, 244))
+        def squares(mask):
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            return [cv2.boundingRect(c) for c in contours
+                    if 25 <= cv2.boundingRect(c)[2] <= 65
+                    and 25 <= cv2.boundingRect(c)[3] <= 65
+                    and abs(cv2.boundingRect(c)[2] - cv2.boundingRect(c)[3]) <= 5]
+        for x, y, width, height in squares(dark):
+            adjacent = sorted((r for r in squares(light)
+                               if abs(r[1] - y) <= 4 and width + 2 <= r[0] - x <= width + 20),
+                              key=lambda r: r[0])
+            if adjacent:
+                nx, ny, nw, nh = adjacent[0]
+                # Derive screenshot-to-CSS scaling from viewport dimensions.
+                viewport = page.evaluate("() => ({w: innerWidth, h: innerHeight})")
+                sx, sy = W / viewport["w"], H / viewport["h"]
+                return ((nx + nw / 2) / sx, (footer_y + ny + nh / 2) / sy), "adjacent"
         y0 = int(H * 0.65)
         crop = im.crop((0, y0, W, H))
         scale = 3
@@ -625,13 +650,21 @@ def check_login_status():
 
 def _setup_poilist_capture():
     """在当前页面设置响应监听，捕获 poiList 的完整 URL（含签名）"""
-    global _poi_list_url, _poi_list_body
+    global _poi_list_url, _poi_list_body, _poi_capture_subscription
     try:
         page = get_page()
         if not page:
             return
+        if _poi_capture_subscription:
+            previous_page, previous_handler = _poi_capture_subscription
+            if previous_page is page:
+                return
+            try:
+                previous_page.remove_listener("response", previous_handler)
+            except Exception:
+                pass
         def on_resp(resp):
-            global _poi_list_url
+            global _poi_list_url, _poi_list_body
             try:
                 url = resp.url
                 if "poiList" in url and _poi_list_url is None:
@@ -647,6 +680,7 @@ def _setup_poilist_capture():
             except:
                 pass
         page.on("response", on_resp)
+        _poi_capture_subscription = (page, on_resp)
         # 已连接现有浏览器时，主动 reload 一次触发请求
         try:
             page.goto(MEITUAN_HOME_URL, wait_until="domcontentloaded", timeout=15000)
@@ -915,6 +949,52 @@ def _verify_shop_after_switch(page, shop_name, attempts=4):
     return False, actual, source
 
 
+def _collect_shop_pages(page, read_rows):
+    """Read all management pages; never return a silently truncated list."""
+    all_rows = {}
+    signatures = set()
+    deadline = time.monotonic() + 15
+    frame = None
+    rows = []
+    while time.monotonic() < deadline and not rows:
+        for candidate in page.frames:
+            try:
+                rows = read_rows(candidate)
+                if rows:
+                    frame = candidate
+                    break
+            except Exception:
+                continue
+        if not rows:
+            page.wait_for_timeout(200)
+    if not rows:
+        raise RuntimeError("未找到门店管理表")
+    for index in range(100):
+        signature = tuple(row["id"] for row in rows)
+        if signature in signatures:
+            raise RuntimeError("分页重复返回相同门店，已停止")
+        signatures.add(signature)
+        all_rows.update((row["id"], row) for row in rows)
+        log(f"门店分页: 第{index + 1}页，{len(rows)}家，累计{len(all_rows)}家")
+        next_button = frame.get_by_text("»", exact=True)
+        if next_button.count() != 1:
+            raise RuntimeError("无法唯一识别门店下一页按钮")
+        disabled = next_button.evaluate("""el => !!el.closest('.disabled,[aria-disabled="true"]') || el.disabled === true""")
+        if disabled:
+            return list(all_rows.values())
+        next_button.click(timeout=2000)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            page.wait_for_timeout(150)
+            updated = read_rows(frame)
+            if updated and tuple(row["id"] for row in updated) != signature:
+                rows = updated
+                break
+        else:
+            raise RuntimeError("点击下一页后门店数据未更新")
+    raise RuntimeError("门店页数超过安全上限")
+
+
 def cmd_scrape_shops(args):
     """爬取店铺列表（服务商账号多个店铺；单店账号顶栏直接显示店名）"""
     if not _browser or not _browser.is_connected():
@@ -926,164 +1006,52 @@ def cmd_scrape_shops(args):
         send({"type": "error", "message": "浏览器未连接"})
         return
 
-    # 关键：先确认已登录，并等待商家后台真正渲染出「全部门店」切换器。
-    # 避免登录刚跳转、页面还没加载完就抓取，导致误报“未找到店铺”。
     if not check_login_status():
-        send({"type": "error", "message": "请先在浏览器中完成美团登录，登录成功后再读取店铺"})
+        send({"type": "error", "message": "请先登录美团"})
         return
-    try:
-        page.goto(MEITUAN_HOME_URL, wait_until="domcontentloaded", timeout=20000)
-    except:
-        pass
-    # 等待后台页面渲染（最多 10 秒），出现「全部门店」或单店顶栏店名即提前就绪；
-    # 单店账号没有该切换器，因此不强制要求，超时也继续往下走接口抓取。
-    for _ in range(10):
+    # Read the management table's ID and selected business-status option.
+    # Dropdown status (e.g. preorder only) is not the management business status.
+    # Open the platform's own all-stores entry first; route fallback is bounded.
+    opened = False
+    for frame in page.frames:
         try:
-            if page.get_by_text("全部门店", exact=False).count() > 0:
+            entry = frame.get_by_text("全部门店", exact=True)
+            if entry.count() and entry.first.is_visible():
+                entry.first.click(timeout=1500)
+            view_all = frame.get_by_text("查看全部门店", exact=False)
+            if view_all.count() and view_all.first.is_visible():
+                view_all.first.click(timeout=1500)
+                opened = True
                 break
-            if _extract_top_shop_name_from_dom(page):
-                break
-        except:
-            pass
-        time.sleep(1)
+        except Exception:
+            continue
+    if not opened:
+        page.goto("https://e.waimai.meituan.com/#/v2/shop/manage",
+                  wait_until="domcontentloaded", timeout=12000)
+    def read_rows(frame):
+        return frame.evaluate(r"""() => Array.from(
+                document.querySelectorAll('tr[data-id]')
+            ).flatMap(row => {
+                const id = (row.getAttribute('data-id') || '').trim();
+                const nameCell = row.querySelector('[data-name][data-id]');
+                const selected = row.querySelector('select[data-id]');
+                if (!nameCell || nameCell.dataset.id !== id || (selected && selected.dataset.id !== id)) return [];
+                const name = (nameCell.dataset.name || '').trim();
+                const status = (selected?.selectedOptions[0]?.textContent || '非营业中').trim();
+                const open = selected?.value === '1' && status === '营业中';
+                return /^\d+$/.test(id) && name ? [{id, poiId:id, name,
+                    businessStatus: open ? '营业中' : status || '状态未知', source:'meituan'}] : [];
+            })""")
 
-    shops = []
-    account = None
-
-    # 主方案 A：解析 poiList 接口返回（账号下店铺的权威数据源，最准确）
     try:
-        captured = _poi_list_body
-        if not captured:
-            cap = []
-
-            def _on_poi(resp, _c=cap):
-                try:
-                    if "poiList" in resp.url:
-                        b = resp.text()
-                        if b and len(b) > 20 and not b.lstrip().startswith("<"):
-                            _c.append(b)
-                except:
-                    pass
-
-            page.on("response", _on_poi)
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=20000)
-            except:
-                pass
-            time.sleep(3)
-            try:
-                page.remove_listener("response", _on_poi)
-            except:
-                pass
-            if cap:
-                captured = cap[-1]
-        if captured:
-            import json as _json
-            names = _extract_shops_from_json(_json.loads(captured))
-            log(f"poiList 接口解析到 {len(names)} 个店铺")
-            for i, nm in enumerate(names[:50]):
-                shops.append({"id": f"shop_{int(time.time())}_{i}", "name": nm, "source": "meituan"})
-    except Exception as e:
-        log(f"poiList 解析失败: {e}")
-
-    if shops:
-        if not account:
-            account = _extract_account_from_page(page) or ""
-        send({"type": "shops_fetched", "shops": shops, "count": len(shops), "account": account})
+        rows = _collect_shop_pages(page, read_rows)
+    except Exception as exc:
+        log(f"门店完整列表读取失败: {exc}")
+        send({"type": "error", "message": f"门店列表读取不完整，未执行绑定：{exc}"})
         return
-
-    # 主方案 B：点击右上角"全部门店"切换器，从弹出的门店列表浮层提取
-    try:
-        switcher = page.get_by_text("全部门店", exact=False)
-        if switcher.count() > 0:
-            switcher.first.click(timeout=5000)
-            time.sleep(2)
-            extracted = page.evaluate("""() => {
-                const noise = new Set([
-                    '商家首页','订单管理','商品管理','顾客管理','财务管理','经营分析','活动中心',
-                    '体验中心','店铺设置','外卖课堂','服务市场','商家保险','帮扶动态','平台规则',
-                    '全部分类','向左收起','向右展开','全部门店','门店','切换门店','选择门店',
-                    '营业中','停业中','门店上线中','仅接受预订','休息中','已下线','审核中'
-                ]);
-                const r = [];
-                let acct = null;
-                const seen = new Set();
-                document.querySelectorAll('*').forEach(el => {
-                    if (el.children.length > 0) return;
-                    const t = (el.textContent || '').trim();
-                    if (!t || t.length < 2 || t.length > 40 || seen.has(t)) return;
-                    if (noise.has(t)) return;
-                    // 美团账号名：纯字母数字下划线（如 fwsc_3187_001）
-                    if (/^[a-zA-Z][a-zA-Z0-9_]{2,}$/.test(t)) {
-                        if (!acct) acct = t;
-                        return;
-                    }
-                    if (/^\\d+$/.test(t)) return;
-                    if (/^全部门店（?共/.test(t)) return;
-                    seen.add(t);
-                    const z = parseInt(getComputedStyle(el).zIndex) || 0;
-                    const inPop = !!el.closest('[class*="dropdown"],[class*="popover"],[class*="popup"],[class*="menu"],[class*="poi"],[class*="shop"]');
-                    if (z > 50 || inPop) r.push(t);
-                });
-                return { shops: r.slice(0, 50), account: acct };
-            }""")
-            names = extracted.get("shops", []) if isinstance(extracted, dict) else (extracted or [])
-            account = extracted.get("account") if isinstance(extracted, dict) else None
-            log(f"浮层提取到 {len(names)} 个店铺，账号={account}")
-            for i, nm in enumerate(names):
-                shops.append({"id": f"shop_{int(time.time())}_{i}", "name": nm, "source": "meituan"})
-            try:
-                page.keyboard.press("Escape")
-            except:
-                pass
-    except Exception as e:
-        log(f"点击全部门店失败: {e}")
-
-    # 主方案 C：单店账号没有「全部门店」切换器，顶栏同一位置的 span.txt 直接显示店铺名
-    if not shops:
-        try:
-            current_name = _extract_top_shop_name_from_dom(page)
-            if current_name:
-                shops.append({"id": f"shop_{int(time.time())}_0", "name": current_name, "source": "meituan"})
-                log(f"顶栏 DOM 提取到单店店铺名: {current_name}")
-        except Exception as e:
-            log(f"顶栏店铺名提取失败: {e}")
-
-    # 兜底：API 响应解析（单店账号）
-    if not shops:
-        try:
-            cap = []
-            def on_resp(resp):
-                if "homePage" in resp.url:
-                    try:
-                        b = resp.text()
-                        if b and len(b) > 100 and not b.lstrip().startswith("<"):
-                            cap.append(b)
-                    except:
-                        pass
-            page.on("response", on_resp)
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=15000)
-            except:
-                pass
-            time.sleep(4)
-            page.remove_listener("response", on_resp)
-            for body in cap:
-                import json as _json
-                data = _json.loads(body)
-                # 优先递归提取（兼容 wmPoiName / poiName / shopName 等字段）
-                names = _extract_shops_from_json(data)
-                name = names[0] if names else None
-                if not name and isinstance(data.get("data"), dict):
-                    name = data["data"].get("wmPoiName")
-                if name and name != "全部门店":
-                    shops.append({"id": "shop_0", "name": name, "source": "meituan"})
-                    break
-        except Exception as e:
-            log(f"兜底解析失败: {e}")
-
-    if not account:
-        account = _extract_account_from_page(page) or ""
+    shops = list({row["id"]: row for row in rows if row["businessStatus"] in ("营业中", "休息中")}.values())
+    account = _extract_account_from_page(page) or ""
+    log(f"门店管理读取 {len(rows)} 家，本次可绑定营业中/休息中 {len(shops)} 家")
     send({"type": "shops_fetched", "shops": shops, "count": len(shops), "account": account})
 
 
@@ -1164,17 +1132,50 @@ def _click_text_deep_retry(page, text, tries=5, wait_ms=2000, timeout=3000):
     return False
 
 
+def _dismiss_order_rule_notice(page):
+    """Dismiss only the known informational notice, never arbitrary dialogs."""
+    title = "订单自动完成规则说明"
+    for frame in page.frames:
+        try:
+            titles = frame.get_by_text(title, exact=True)
+            for index in range(titles.count()):
+                heading = titles.nth(index)
+                if not heading.is_visible():
+                    continue
+                # Scope the acknowledgement to the nearest enclosing modal.
+                modal = heading.locator(
+                    "xpath=ancestor::*[@role='dialog' or contains(@class,'roo-modal') "
+                    "or contains(@class,'modal-content') or contains(@class,'dialog')][1]"
+                )
+                if modal.count() == 0:
+                    log("规则提示存在，但无法确认弹窗边界，停止导航")
+                    return False
+                button = modal.get_by_text("我知道了", exact=True)
+                if button.count() != 1 or not button.is_visible() or not button.is_enabled():
+                    log("规则弹窗确认按钮不可用，停止导航")
+                    return False
+                button.click(timeout=1500)
+                heading.wait_for(state="hidden", timeout=3000)
+                log("已关闭「订单自动完成规则说明」，确认遮挡消失")
+        except Exception as exc:
+            log(f"规则弹窗处理失败: {type(exc).__name__}")
+            return False
+    return True
+
+
 def _open_review_list_tab(page, max_tries=5):
     """进入「顾客评价」后必须点击顶部「外卖评价列表」标签，comment/list 才会触发。
     新开窗口默认停在「综合评分明细」标签。标签栏可能位于 iframe/Flutter 内：
     先遍历所有 frame 按文本点，失败再 OCR 定位点击。"""
     for _ in range(max_tries):
+        if not _dismiss_order_rule_notice(page):
+            return False
         clicked = False
         for fr in page.frames:
             try:
                 loc = fr.get_by_text("外卖评价列表", exact=False)
-                if loc.count() > 0:
-                    loc.first.click(timeout=3000)
+                if loc.count() > 0 and loc.first.is_visible() and loc.first.is_enabled():
+                    loc.first.click(timeout=1000)
                     clicked = True
                     break
             except Exception:
@@ -1191,7 +1192,8 @@ def _open_review_list_tab(page, max_tries=5):
                 return True
         except Exception as e:
             log(f"OCR 定位标签失败: {e}")
-        page.wait_for_timeout(1500)
+        if max_tries > 1:
+            page.wait_for_timeout(250)
     log("未找到「外卖评价列表」标签")
     return False
 
@@ -1801,6 +1803,11 @@ def cmd_scrape_reviews(args):
     if not complete:
         log(f"重试后仍不完整：pagesFetched={pages_fetched} pagesExpected={pages_expected}，本次标记为部分数据")
 
+    missing_pages = sorted(set(range(1, total_pages + 1)) - pages_seen) if total_pages else []
+    if missing_pages:
+        log(f"抓取不完整: 缺少页码={missing_pages}")
+        send({"type": "error", "message": f"评价未抓全：预计{total_pages}页，缺少{missing_pages}。未将本次部分数据标记为成功，请检查浏览器和日志后重试"})
+        return
     reviews = []
     seen = set()
     total_seen = 0
@@ -1842,6 +1849,140 @@ def cmd_scrape_reviews(args):
     send({"type": "reviews_fetched", "reviews": reviews, "count": saved,
           "total": total_seen, "skipped": skipped, "shopName": shop_name,
           "complete": complete, "pagesExpected": pages_expected, "pagesFetched": pages_fetched})
+
+
+def _wait_appeal_type(page, timeout=4):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for frame in page.frames:
+            try:
+                heading = frame.get_by_text("选择申诉类型", exact=False)
+                other = frame.get_by_text("其他", exact=True)
+                if heading.count() and heading.first.is_visible() and other.count() and other.first.is_visible():
+                    return True
+            except Exception:
+                continue
+        page.wait_for_timeout(200)
+    boxes = _ocr_pick(page, ["选择申诉类型", "其他", "下一步"])
+    texts = [text.strip() for text, _, _ in boxes]
+    return any("选择申诉类型" in text for text in texts) and "其他" in texts
+
+
+def _click_target_appeal(page, content):
+    """Only open an appeal associated with a uniquely matched review."""
+    key = re.sub(r"\s+", "", content or "")[:12]
+    if len(key) < 6:
+        log("评价内容不足以唯一定位申诉入口")
+        return False
+    for frame in page.frames:
+        try:
+            anchor = frame.get_by_text(content, exact=True)
+            if anchor.count() == 1:
+                card = anchor.locator("xpath=ancestor::*[.//*[normalize-space(text())='申诉']][1]")
+                button = card.get_by_text("申诉", exact=True)
+                if button.count() == 1 and button.is_visible():
+                    rect = button.bounding_box()
+                    if rect:
+                        page.mouse.click(rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] / 2)
+                        if _wait_appeal_type(page):
+                            return True
+                        log("DOM申诉点击未进入类型页，转为图像定位")
+        except Exception:
+            continue
+    # Canvas fallback: match review content, then the first individual appeal
+    # below it, before the next review's date. Never click a global first match.
+    for attempt in range(8):
+        log(f"申诉定位: 第{attempt + 1}轮，开始识别目标评价")
+        boxes = _ocr_zone(page, f"appeal_loc_{attempt}", x_frac0=0.2, scale=2)
+        anchors = [(x, y) for text, x, y in boxes
+                   if key in re.sub(r"\s+", "", text)]
+        if len(anchors) == 1:
+            ax, ay = anchors[0]
+            next_dates = [y for text, x, y in boxes
+                          if re.search(r"20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}", text) and y > ay]
+            boundary = min(next_dates) if next_dates else float('inf')
+            buttons = [(x, y) for text, x, y in boxes if text.strip() == "申诉"
+                       and ay < y < boundary]
+            if len(buttons) == 1:
+                page.mouse.click(*buttons[0])
+                if _wait_appeal_type(page):
+                    log("目标申诉入口已打开，类型选择页已确认")
+                    return True
+                log("申诉按钮点击后页面未切换，停止以避免误操作")
+                return False
+        elif len(anchors) > 1:
+            log("评价内容匹配不唯一，停止申诉")
+            return False
+        # CDP attaches to a real window; viewport_size can be None. Never use
+        # a guessed 1200px viewport: it places the wheel outside the review pane.
+        viewport = page.evaluate("() => ({width: innerWidth, height: innerHeight})")
+        if not viewport or viewport["width"] <= 0 or viewport["height"] <= 0:
+            log("无法读取真实窗口尺寸，停止定位")
+            return False
+        x, y = viewport["width"] * 0.6, viewport["height"] * 0.75
+        log(f"申诉定位: 匹配数={len(anchors)}，窗口={viewport}，在评价区域滚动")
+        page.mouse.move(x, y)
+        page.mouse.wheel(0, viewport["height"] * 0.45)
+        page.wait_for_timeout(400)
+    return False
+
+
+def _appeal_click_exact(page, text):
+    for frame in page.frames:
+        try:
+            loc = frame.get_by_text(text, exact=True)
+            visible = [loc.nth(i) for i in range(loc.count()) if loc.nth(i).is_visible()]
+            if len(visible) == 1 and visible[0].is_enabled():
+                rect = visible[0].bounding_box()
+                if rect:
+                    page.mouse.click(rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] / 2)
+                    log(f"申诉步骤点击: {text} (DOM矩形)")
+                    return True
+        except Exception:
+            continue
+    matches = [item for item in _ocr_pick(page, [text]) if item[0].strip() == text]
+    if len(matches) == 1:
+        _, x, y = matches[0]
+        page.mouse.click(x, y)
+        return True
+    if text in ("下一步", "提交"):
+        boxes = _ocr_zone(page, "appeal_action", x_frac0=0.25, y_frac0=0.6, scale=3)
+        matches = [(x, y) for label, x, y in boxes if label.replace(" ", "") == text]
+        if len(matches) == 1:
+            page.mouse.click(*matches[0])
+            log(f"申诉步骤点击: {text} (底部放大识别)")
+            return True
+    log(f"申诉步骤定位失败: {text}")
+    return False
+
+
+def _fill_appeal_description(page, description, timeout=8):
+    # Flutter creates its text input host only after the canvas field is focused.
+    activated = False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for frame in page.frames:
+            try:
+                loc = frame.locator('textarea')
+                visible = [loc.nth(i) for i in range(loc.count()) if loc.nth(i).is_visible()]
+                if len(visible) == 1:
+                    visible[0].fill(description, timeout=1500)
+                    if visible[0].input_value() == description:
+                        log("申诉问题描述已填入并逐字核对")
+                        return True
+            except Exception:
+                continue
+        if not activated:
+            activated = True
+            boxes = _ocr_pick(page, ["请描述问题详情"])
+            matches = [(x, y) for label, x, y in boxes
+                       if label.replace(" ", "") == "请描述问题详情"]
+            if len(matches) == 1:
+                page.mouse.click(*matches[0])
+                log("申诉问题描述输入区已激活(OCR)")
+                deadline = time.monotonic() + timeout
+        page.wait_for_timeout(150)
+    return False
 
 
 def cmd_run_appeal(args):
@@ -1912,31 +2053,42 @@ def cmd_run_appeal(args):
         except Exception as e:
             log(f"选择类型/下一步失败: {e}")
 
-        # 5. 填写「问题描述」（必填，至少5个字，否则提交按钮禁用）
+        # Each stage must succeed before the next one is attempted.
+        if not _appeal_click_exact(page, "其他"):
+            send({"type": "error", "message": "未能选择申诉类型「其他」，已停止"})
+            return
+        if not _appeal_click_exact(page, "下一步"):
+            send({"type": "error", "message": "未找到可用的下一步按钮，已停止"})
+            return
         desc = appeal_content.strip()
-        if not desc:
-            desc = "该评价与实际情况不符，我方已按规范出餐与配送，不存在评价所述问题，恳请平台核实。"
-        if len(desc) < 5:
-            desc = desc + "，恳请平台核实处理。"
-        try:
-            ta = page.locator("textarea").first
-            if ta.count() > 0:
-                ta.click()
-                ta.fill(desc)
-                # 触发输入事件，确保字数校验生效、提交按钮解锁
+        if not 10 <= len(desc) <= 300:
+            send({"type": "error", "message": "申诉理由须为10至300字，未提交"})
+            return
+        # The detail page shows the selected type and a problem-description field.
+        deadline = time.monotonic() + 8
+        type_confirmed = False
+        while time.monotonic() < deadline:
+            for frame in page.frames:
                 try:
-                    ta.press(" ")
-                    ta.press("Backspace")
-                except:
-                    pass
-                log(f"已填写问题描述（{len(desc)}字）")
-            else:
-                log("未找到问题描述输入框")
-        except Exception as e:
-            log(f"填写问题描述失败: {e}")
-
-        # 6. 上传证明图片（可选；有则传，没有也能提交）——核心：set_input_files，不走OCR
-        img_paths = [p.strip() for p in images.split(",") if p.strip()]
+                    if (frame.get_by_text("其他", exact=True).first.is_visible()
+                            and frame.get_by_text("问题描述", exact=False).first.is_visible()):
+                        type_confirmed = True
+                        break
+                except Exception:
+                    continue
+            if type_confirmed:
+                break
+            page.wait_for_timeout(150)
+        if not type_confirmed:
+            boxes = _ocr_pick(page, ["申诉类型", "其他", "问题描述", "请描述问题详情"])
+            labels = [label.replace(" ", "") for label, _, _ in boxes]
+            type_confirmed = ("其他" in labels and "申诉类型" in labels
+                              and any("问题描述" in label for label in labels))
+        log(f"申诉详情页校验: {type_confirmed}")
+        if not type_confirmed or not _fill_appeal_description(page, desc):
+            send({"type": "error", "message": "未确认进入「其他」申诉详情页或问题描述未正确填入，未提交"})
+            return
+        img_paths = [path.strip() for path in images.split(",") if path.strip()]
         uploaded = 0
         if img_paths:
             try:
@@ -2793,12 +2945,12 @@ def _list_btn_min_x(page):
     return vw * 0.55
 
 
-def _click_reply_button_for(page, review, k):
+def _click_reply_button_for(page, review, k, page_reviews=None):
     """定位并点击目标评价的「回复」按钮，并确认编辑器展开。
     评价卡片由 Flutter canvas 绘制（DOM 里只有绘制产物、无事件处理器，元素点击无效），
     唯一可靠路径：OCR 放大定位按钮坐标 → CDP 可信鼠标点击（带抖动重试，OCR 确认编辑器出现）。
     定位优先按评价内容文本锚定（内容下方最近的「回复」按钮即同卡片按钮）；
-    OCR 读不出内容时退化为第 k 个可见按钮（仅未滚动的首屏有效）。
+    根据同页文字间距小步滚动，文字不唯一时不按按钮序号猜测。
     返回 (是否已点开编辑器, None)"""
     key = ((review.get("content") or "").strip())[:10]
     # 0) 清理可能残留的旧编辑器：先用 DOM 判断是否真的开着，避免每次都盲跑一次 OCR
@@ -2812,38 +2964,40 @@ def _click_reply_button_for(page, review, k):
     except Exception:
         pass
     btn = None
-    for attempt in range(6):
+    for attempt in range(24):
         boxes = _ocr_zone(page, f"loc{attempt}", x_frac0=0.2, scale=2)
         min_x = _list_btn_min_x(page)
-        btns = sorted([(x, y) for t, x, y in boxes if t == "回复" and x > min_x],
-                      key=lambda c: c[1])
-        anchor_y = None
-        if len(key) >= 6:
-            for t, x, y in boxes:
-                if len(t) >= 4 and (key[:4] in t or t[:4] in key):
-                    anchor_y = y
-                    break
+        anchors = [(x, y) for t, x, y in boxes
+                   if len(key) >= 6 and key in re.sub(r"\s+", "", t)]
+        anchor_y = anchors[0][1] if len(anchors) == 1 else None
+        known_y = []
+        for row in page_reviews or [review]:
+            fragment = re.sub(r"\s+", "", row.get("content") or "")[:16]
+            hits = [y for t, x, y in boxes if len(fragment) >= 6
+                    and fragment in re.sub(r"\s+", "", t)]
+            if len(hits) == 1:
+                known_y.append(hits[0])
+        known_y = sorted(set(known_y))
+        gaps = [b - a for a, b in zip(known_y, known_y[1:]) if b - a > 40]
         if anchor_y is not None:
-            below = [b for b in btns if b[1] > anchor_y]
-            if below:
-                btn = below[0]
-                log(f"内容锚定目标卡片「回复」按钮(k={k} key={key[:8]}… 坐标=({btn[0]},{btn[1]}))")
+            boundaries = [y for y in known_y if y > anchor_y]
+            boundaries += [y for t, x, y in boxes
+                           if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t.strip()) and y > anchor_y]
+            bottom = min(boundaries) if boundaries else float("inf")
+            candidates = [(x, y) for t, x, y in boxes
+                          if t == "回复" and x > min_x and anchor_y < y < bottom]
+            if len(candidates) == 1:
+                btn = candidates[0]
+                log(f"目标文字与卡片边界匹配，定位回复按钮: {review.get('platformReviewId')}")
                 break
-        if attempt == 0 and anchor_y is None and len(btns) > k:
-            btn = btns[k]
-            log(f"第{k}个可见「回复」按钮(坐标=({btn[0]},{btn[1]}))")
-            break
-        # 目标不在视口内：滚动评价列表后重试（滚轮必须落在卡片列表上，
-        # 筛选面板区域不响应滚轮）
-        try:
-            vw = page.evaluate("() => window.innerWidth || 800")
-            vh = page.evaluate("() => window.innerHeight || 600")
-        except Exception:
-            vw, vh = 800, 600
-        page.mouse.move(vw * 0.6, vh * 0.8)
-        page.wait_for_timeout(200)
-        page.mouse.wheel(0, 600)
-        page.wait_for_timeout(1000)
+        viewport = page.evaluate("() => ({width:innerWidth,height:innerHeight})")
+        step = min(220, viewport["height"] * 0.18, min(gaps) * 0.4 if gaps else 180)
+        if anchor_y is not None:
+            step = min(step, 80, max(20, anchor_y * 0.3))
+        log(f"回复定位第{attempt + 1}轮: 目标文字={anchor_y is not None}, 间距={gaps}, 滚动={step:.0f}")
+        page.mouse.move(viewport["width"] * 0.6, viewport["height"] * 0.8)
+        page.mouse.wheel(0, step)
+        page.wait_for_timeout(300)
     if not btn:
         log(f"目标评价「回复」按钮未定位到(k={k} key={key[:8]}…)")
         return False, None
@@ -2898,6 +3052,32 @@ def _click_reply_button_for(page, review, k):
         page.wait_for_timeout(400)
     log(f"「回复」按钮抖动点击均未展开编辑器(k={k} 坐标=({bx},{by}))")
     return False, None
+
+
+def _read_reply_editor_values(page):
+    """Read current visible Flutter editors, including open shadow roots."""
+    values = []
+    for frame in page.frames:
+        try:
+            values.extend(frame.evaluate("""() => {
+                const values = [];
+                function walk(root) {
+                    for (const el of root.querySelectorAll('*')) {
+                        if (el.matches('textarea.flt-text-editing')) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 50 && r.height > 15 && getComputedStyle(el).visibility !== 'hidden') {
+                                values.push(el.value);
+                            }
+                        }
+                        if (el.shadowRoot) walk(el.shadowRoot);
+                    }
+                }
+                walk(document);
+                return values;
+            }"""))
+        except Exception:
+            continue
+    return values
 
 
 def _rpa_reply_one(page, reply_events, text, card_eh=None, expect_pid=None):
@@ -3039,6 +3219,11 @@ def _rpa_reply_one(page, reply_events, text, card_eh=None, expect_pid=None):
             break
         log(f"键入校验未通过(rnd={rnd} 计数器={has_cnt} 乱码={bad_chars})")
     if not ok_typed:
+        try:
+            page.screenshot(path=os.path.join(_REPLY_DBG_DIR, "typing_fail.png"))
+        except Exception:
+            pass
+        return False, "回复内容校验失败，未提交"
         if _DEBUG_SHOTS:
             try:
                 page.screenshot(path=os.path.join(_REPLY_DBG_DIR, "typing_fail.png"))
@@ -3101,6 +3286,70 @@ def _rpa_reply_one(page, reply_events, text, card_eh=None, expect_pid=None):
     return False, "提交后未捕获到回复接口响应（超时）"
 
 
+def _reply_search(page, keyword, responses):
+    """Change the actual search field and require a newly received list."""
+    before = len(responses)
+    for frame in page.frames:
+        try:
+            field = frame.get_by_placeholder("关键词搜索", exact=True)
+            if field.count() == 1 and field.is_visible():
+                field.fill(keyword, timeout=1500)
+                field.press("Enter", timeout=1500)
+                break
+        except Exception:
+            continue
+    else:
+        # Canvas field must first be focused; never type into an unknown editor.
+        boxes = _ocr_pick(page, ["关键词搜索"])
+        matches = [(x, y) for t, x, y in boxes if t.strip() == "关键词搜索"]
+        if len(matches) != 1:
+            return False
+        page.mouse.click(*matches[0])
+        for frame in page.frames:
+            field = frame.locator("input:focus, textarea:focus")
+            if field.count() == 1:
+                field.fill(keyword, timeout=1500)
+                field.press("Enter", timeout=1500)
+                break
+        else:
+            return False
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if len(responses) > before:
+            return True
+        page.wait_for_timeout(100)
+    return False
+
+
+def _reply_rating(page, rating, responses):
+    label = "差评" if rating in (1, 2) else "中评" if rating == 3 else "好评" if rating in (4, 5) else None
+    if label is None:
+        return False
+    before = len(responses)
+    clicked = False
+    for frame in page.frames:
+        try:
+            loc = frame.get_by_text(re.compile("^" + label + r"[（(]"))
+            if loc.count() == 1 and loc.is_visible():
+                loc.click(timeout=1500)
+                clicked = True
+                break
+        except Exception:
+            continue
+    if not clicked:
+        matches = [(x, y) for t, x, y in _ocr_pick(page, [label])
+                   if re.match("^" + label + r"[（(]", t)]
+        if len(matches) != 1:
+            return False
+        page.mouse.click(*matches[0])
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if len(responses) > before:
+            return True
+        page.wait_for_timeout(100)
+    return False
+
+
 def cmd_reply_reviews(args):
     """批量回复评价（RPA 模式，对标西瓜本地客户端）：
     OCR 定位「回复/提交」按钮 + CDP 键鼠注入，全程不占用用户鼠标、无需窗口置顶。
@@ -3129,38 +3378,27 @@ def cmd_reply_reviews(args):
         send({"type": "reply_done", "results": [], "message": "待回复项缺少评价ID或回复文本"})
         return
 
+    started = time.monotonic()
     if shop_name:
-        _switch_to_shop(page, shop_name)
+        ok, actual, source = _switch_and_verify(page, shop_name)
+        if not ok:
+            _send_shop_not_found(shop_name, actual, source)
+            return
 
-    # 导航到评价页：优先直跳 hash 路由（页面常会自动跳回裸首页并卡在「加载中...」，
-    # 菜单点击此时必然失败；直跳可恢复），失败再回退菜单点击
-    _nav_ok = False
-    try:
-        page.goto(REVIEW_PAGE_URL, wait_until="domcontentloaded", timeout=20000)
-        _nav_ok = True
-        log(f"已直跳评价页: {page.url[:90]}")
-    except Exception as e:
-        log(f"直跳评价页失败，回退菜单点击: {e}")
-    if not _nav_ok:
-        _click_text_deep_retry(page, "顾客管理")
-        time.sleep(1)
-        if not _click_text_deep_retry(page, "顾客评价"):
-            _click_text_deep_retry(page, "评价管理")
-        time.sleep(3)
-    log(f"回复导航后 URL: {page.url} frames={len(page.frames)}")
     latest = {}
     page_rows = []      # 最近一次 comment/list 的有序行（当前页）
+    navigation_responses = []
     reply_events = []   # 页面自发回复请求的结果 {toCommentId, ok, message}
 
     def _on_resp(resp):
         try:
             u = resp.url.lower()
-            if "comment" in u:
-                try:
-                    _db = resp.text() or ""
-                except Exception:
-                    _db = ""
-                log(f"[dbg] {resp.request.method} {resp.url[:110]} status={resp.status} len={len(_db)} head={_db[:60]!r}")
+            if "comment/list" not in u and "comment/reply" not in u:
+                return
+            if shop_name:
+                actual = _extract_top_shop_name_from_dom(page, require_anchored=True)
+                if not actual or not _shop_names_match(actual, shop_name):
+                    return
             if "comment/list" in u:
                 try:
                     b = resp.text()
@@ -3168,6 +3406,7 @@ def cmd_reply_reviews(args):
                     # （正常响应体里可能恰好包含 403 子串，此前误杀过有效响应）
                     if resp.status == 200 and b and len(b) > 50 and "403 Forbidden" not in b:
                         rows, _t = _extract_reviews_from_json(json.loads(b))
+                        navigation_responses.append(b)
                         page_rows[:] = rows
                         for r in rows:
                             latest[r["platformReviewId"]] = r
@@ -3213,69 +3452,58 @@ def cmd_reply_reviews(args):
     results = []
     done_ids = set()
     try:
-        try:
-            page.reload(wait_until="domcontentloaded", timeout=20000)
-        except Exception:
-            pass
-        # reload 会回到默认「综合评分明细」标签，必须点「外卖评价列表」才有 comment/list
-        _open_review_list_tab(page)
-        # 等首轮评价列表
-        for _ in range(10):
-            page.wait_for_timeout(1000)
-            if page_rows:
-                break
-        if not page_rows:
-            # 兜底：可能标签点击与 reload 竞态，再点一次标签
-            _open_review_list_tab(page, max_tries=3)
-            for _ in range(5):
-                page.wait_for_timeout(1000)
-                if page_rows:
-                    break
-        if not page_rows:
-            log("未监听到评价列表接口，放弃本轮回复")
-            send({"type": "error", "message": "未监听到评价列表接口（comment/list），无法回复"})
+        if not _prepare_review_capture(page, navigation_responses, shop_name):
+            send({"type": "error", "message": "未收到目标店铺评价首页，已停止回复"})
             return
+        log(f"回复导航就绪，耗时={time.monotonic() - started:.2f}s")
 
-        MAX_PAGES = 5
-        log(f"待回复目标: {list(text_map.keys())}")
-        for page_no in range(1, MAX_PAGES + 1):
-            if len(done_ids) >= len(text_map):
-                break
-            ordered = list(page_rows)
-            unreplied_all = [r for r in ordered if r.get("replyStatus") != "replied"]
-            targets = [r for r in unreplied_all
-                       if r["platformReviewId"] in text_map
-                       and r["platformReviewId"] not in done_ids]
-            log(f"第{page_no}页: 本页rows={len(ordered)} 未回={len(unreplied_all)}"
-                f" 目标命中={len(targets)}")
-            if targets:
-                for tgt in targets:
-                    prid = tgt["platformReviewId"]
-                    k = unreplied_all.index(tgt)
-                    opened, card_eh = _click_reply_button_for(page, tgt, k)
-                    if not opened:
-                        log(f"目标 {prid} 未能定位「回复」按钮，本页放弃")
+        # Keep the existing ID-based reply and submission confirmation for every target.
+        for item in sorted(items, key=lambda it: int(it.get("rating") or 0)):
+            prid = str(item.get("platformReviewId") or "")
+            if prid not in text_map or prid in done_ids:
+                continue
+            rating = int(item.get("rating") or 0)
+            fragments = re.findall(r"[\w\u4e00-\u9fff]{4,}", item.get("content") or "")
+            keyword = max(fragments, key=len)[:12] if fragments else ""
+            _reply_rating(page, rating, navigation_responses)
+            found = None
+            if len(keyword) >= 4 and _reply_search(page, keyword, navigation_responses):
+                found = next((r for r in page_rows if r["platformReviewId"] == prid), None)
+            if found is None:
+                # Clearing must succeed before using any fallback page data.
+                if not _reply_search(page, "", navigation_responses):
+                    results.append({"platformReviewId": prid, "success": False,
+                                    "message": "搜索条件未能清除或未收到新列表，已停止该条回复"})
+                    continue
+                for page_no in range(1, 101):
+                    found = next((r for r in page_rows if r["platformReviewId"] == prid), None)
+                    if found is not None:
                         break
-                    ok, msg = _rpa_reply_one(page, reply_events, text_map[prid],
-                                             card_eh=card_eh, expect_pid=prid)
-                    results.append({"platformReviewId": prid, "success": ok, "message": msg})
-                    if ok:
-                        done_ids.add(prid)
-                        latest[prid]["replyStatus"] = "replied"
-                    log(f"RPA回复 {prid}: {'成功' if ok else '失败'} - {msg}")
-                    # 防频控间隔
-                    page.wait_for_timeout(1500 + (len(done_ids) * 3 % 4) * 500)
-            if len(done_ids) >= len(text_map):
-                break
-            if page_no < MAX_PAGES:
-                if not _rpa_goto_page(page, page_no + 1):
-                    break
+                    before = len(navigation_responses)
+                    if not _rpa_goto_page(page, page_no + 1):
+                        break
+                    deadline = time.monotonic() + 8
+                    while len(navigation_responses) == before and time.monotonic() < deadline:
+                        page.wait_for_timeout(100)
+                    if len(navigation_responses) == before:
+                        break
+            if found is None or found.get("replyStatus") == "replied":
+                continue
+            opened, card_eh = _click_reply_button_for(page, found, 0, list(page_rows))
+            if not opened:
+                results.append({"platformReviewId": prid, "success": False, "message": "未定位目标回复按钮"})
+                continue
+            ok, msg = _rpa_reply_one(page, reply_events, text_map[prid], card_eh=card_eh, expect_pid=prid)
+            results.append({"platformReviewId": prid, "success": ok, "message": msg})
+            done_ids.add(prid)  # Never resubmit an uncertain result within the batch.
+            page.wait_for_timeout(1500)
     finally:
         try:
             page.remove_listener("response", _on_resp)
         except Exception:
             pass
 
+    log(f"回复流程结束，总耗时={time.monotonic() - started:.2f}s")
     ok_n = sum(1 for x in results if x["success"])
     extra = ""
     missing = len(text_map) - len({r["platformReviewId"] for r in results})
@@ -3328,35 +3556,75 @@ def _fs_probe_poi_via_reviews(page, timeout_s=18):
     return cap[0] if cap else ""
 
 
-def _fs_open_detail_page(page, poi_id):
-    """打开食安明细页：壳先把 iframe 加载为裸 ruleCenter（地址栏二级 hash 不会被传给
-    iframe，直拼 indicator_detail 路径服务端 404），Flutter 页面加载后需在 frame 内
-    注入 hash 触发运行时路由（与手动点击后的真实行为一致），随后页面才发 indicator/detail。"""
-    try:
-        page.goto("https://e.waimai.meituan.com/#https://waimaieapp.meituan.com"
-                  "/frontweb/ruleCenter",
-                  wait_until="domcontentloaded", timeout=30000)
-    except Exception:
-        pass
-    frame = None
-    for _ in range(15):
-        for fr in page.frames:
-            if "frontweb/ruleCenter" in (fr.url or ""):
-                frame = fr
-                break
-        if frame:
-            break
-        page.wait_for_timeout(1000)
-    if not frame:
+def _fs_detail_point(boxes):
+    """Match the food-safety row only; never choose a global first detail link."""
+    anchors = [(x, y) for text, x, y in boxes
+               if "食品安全负反馈" in text.replace(" ", "")]
+    if len(anchors) != 1:
         return None
-    h = "#/rule/indicator_detail?indicatorCode=food_safety_risk_rank"
-    if poi_id:
-        h += f"&wmPoiId={poi_id}"
-    try:
-        frame.evaluate(f"window.location.hash = {json.dumps(h)};")
-    except Exception:
-        pass
-    return frame
+    ax, ay = anchors[0]
+    links = [(x, y) for text, x, y in boxes
+             if text.replace(" ", "") == "查看明细"
+             and x > ax and abs(y - ay) < 35]
+    return links[0] if len(links) == 1 else None
+
+
+def _fs_open_detail_page(page, poi_id):
+    """Use the platform's food-safety row link instead of guessing its route."""
+    if "userComment" not in page.url:
+        page.goto(REVIEW_PAGE_URL, wait_until="domcontentloaded", timeout=30000)
+    # Finish tab navigation before spending the separate detail-lookup budget.
+    tab_clicked = False
+    for attempt in range(3):
+        _dismiss_order_rule_notice(page)
+        for frame in page.frames:
+            try:
+                tab = frame.get_by_text("综合评分明细", exact=True)
+                if tab.count() == 1 and tab.is_visible():
+                    tab.scroll_into_view_if_needed(timeout=1500)
+                    rect = tab.bounding_box()
+                    if rect:
+                        page.mouse.click(rect["x"] + rect["width"] / 2,
+                                         rect["y"] + rect["height"] / 2)
+                        tab_clicked = True
+                        break
+            except Exception:
+                continue
+        if not tab_clicked:
+            tabs = [(x, y) for text, x, y in _ocr_pick(page, ["综合评分明细"])
+                    if text.replace(" ", "") == "综合评分明细"]
+            if len(tabs) == 1:
+                page.mouse.click(*tabs[0])
+                tab_clicked = True
+        if tab_clicked:
+            log("食安入口: 已点击综合评分明细，开始查找食品安全指标")
+            break
+        page.wait_for_timeout(300)
+    if not tab_clicked:
+        log("食安入口: 未找到综合评分明细标签")
+        return False
+    for attempt in range(3):
+        _dismiss_order_rule_notice(page)
+        for frame in page.frames:
+            try:
+                rows = frame.locator("tr").filter(has_text="食品安全负反馈")
+                if rows.count() == 1:
+                    link = rows.get_by_text("查看明细", exact=True)
+                    if link.count() == 1 and link.is_visible():
+                        link.click(timeout=1500)
+                        log("食安入口: 已点击食品安全负反馈率所在行的查看明细(DOM)")
+                        return True
+            except Exception:
+                continue
+        boxes = _ocr_pick(page, ["食品安全负反馈", "查看明细", "综合评分明细"])
+        point = _fs_detail_point(boxes)
+        if point:
+            page.mouse.click(*point)
+            log("食安入口: 已点击食品安全负反馈率所在行的查看明细(OCR)")
+            return True
+        page.wait_for_timeout(300)
+    log("食安入口: 未能唯一定位食品安全负反馈率的查看明细")
+    return False
 
 
 def cmd_scrape_food_safety(args):
@@ -3386,10 +3654,21 @@ def cmd_scrape_food_safety(args):
             pass
 
     page.on("response", _on_resp)
-    # 1) 评价页探测 poiId（明细页 hash 路由需要 wmPoiId，缺失时页面不发明细请求）
-    poi_id = _fs_probe_poi_via_reviews(page)
-    # 2) 打开明细页：壳加载裸 ruleCenter + frame 内注入 hash 路由
-    _fs_open_detail_page(page, poi_id)
+    # Capture the ID during real navigation; it is not needed to click the entry.
+    poi_cap = []
+    poi_listener = _fs_probe_poi_id(page, poi_cap)
+    try:
+        opened = _fs_open_detail_page(page, "")
+    except Exception:
+        page.remove_listener("response", _on_resp)
+        raise
+    finally:
+        page.remove_listener("request", poi_listener)
+    poi_id = poi_cap[-1] if poi_cap else ""
+    if not opened:
+        page.remove_listener("response", _on_resp)
+        send({"type": "error", "message": "未找到食品安全负反馈率所在行的查看明细，已停止"})
+        return
     # 3) 等明细接口响应（wait_for_timeout 泵事件，time.sleep 会导致回调不执行）
     for _ in range(24):
         if detail_bodies:
@@ -3550,7 +3829,11 @@ def cmd_appeal_food_safety(args):
         return
     shop_name = args.get("shopName", "") or ""
     order_nos = [str(x) for x in (args.get("orderNos") or [])]
-    reason = str(args.get("reason") or "")
+    reason = str(args.get("reason") or "").strip()
+    if not 20 <= len(reason.encode("utf-16-le")) // 2 <= 300:
+        send({"type": "food_safety_appeal_result", "success": False,
+              "message": "食安申诉理由须为20至300字，请修改理由或模板后重试"})
+        return
 
     if shop_name:
         ok, actual_name, verify_source = _switch_and_verify(page, shop_name)
