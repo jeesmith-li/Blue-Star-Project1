@@ -1,0 +1,457 @@
+{
+  "capturedAt": "2026-11-07 18:54:32",
+  "pageUrlNoQuery": "https://waimaieapp.meituan.com/gw/customer/comment/list",
+  "pageTabUrlNoQuery": "https://e.waimai.meituan.com/",
+  "state": "replied_not_appealed",
+  "stateNote": "本页评价为「已回复但未申诉」状态（用户指定）",
+  "total": 4,
+  "pageSize": 10,
+  "pageNumRaw": 0,
+  "reviewCount": 4,
+  "repliedCount": 4,
+  "reviews": [
+    {
+      "id": 10227647710,
+      "userName": "g***3",
+      "rating": 5,
+      "contentPrefix": "",
+      "hasReply": true,
+      "appealFields": [
+        "auditNotPassReason",
+        "auditStatus",
+        "hasAppeal"
+      ]
+    },
+    {
+      "id": 10219411149,
+      "userName": "G***8",
+      "rating": 5,
+      "contentPrefix": "这个兔味道很不错，很好吃，性价比也很高",
+      "hasReply": true,
+      "appealFields": [
+        "auditNotPassReason",
+        "auditStatus",
+        "hasAppeal"
+      ]
+    },
+    {
+      "id": 10219407558,
+      "userName": "C***9",
+      "rating": 5,
+      "contentPrefix": "这家店的外卖包装干净卫生, 餐品分量非常扎实, 餐品物有所值",
+      "hasReply": true,
+      "appealFields": [
+        "auditNotPassReason",
+        "auditStatus",
+        "hasAppeal"
+      ]
+    },
+    {
+      "id": 10219402794,
+      "userName": "小***o",
+      "rating": 5,
+      "contentPrefix": "“荤素搭配”“菜量充足”“包装精美”很好吃得冷吃兔 分量也可",
+      "hasReply": true,
+      "appealFields": [
+        "auditNotPassReason",
+        "auditStatus",
+        "hasAppeal"
+      ]
+    }
+  ],
+  "rawBody": {
+    "success": true,
+    "code": 0,
+    "message": "操作成功",
+    "data": {
+      "total": 4,
+      "pageSize": 10,
+      "pageNum": 0,
+      "list": [
+        {
+          "id": 10227647710,
+          "wmPoiId": 29347390,
+          "poiId": 0,
+          "orderId": 0,
+          "userId": 0,
+          "userName": "g***3",
+          "shipScore": 0,
+          "comment": "",
+          "valid": 1,
+          "ctime": 0,
+          "utime": 0,
+          "shipTime": 0,
+          "cleanComment": "",
+          "commentType": 4,
+          "orderCommentScore": 5,
+          "foodCommentScore": 0,
+          "deliveryCommentScore": 0,
+          "pictureUrls": [],
+          "poiName": "叼叼姐手撕烤兔（长寿菩提古镇店）",
+          "createTime": "2026-10-23",
+          "orderDetails": [
+            {
+              "foodName": "招牌手撕烤兔〖1只装，撕好〗（现吃，装盒）",
+              "count": 1
+            }
+          ],
+          "tasteScore": 5,
+          "qualityScore": 0,
+          "packagingScore": 5,
+          "praiseFoodList": [],
+          "criticFoodList": [],
+          "showReport": 1,
+          "wmCommentReportInfo": {
+            "hasReported": 2,
+            "reportReviewStatus": 0,
+            "reportReadStatus": 0,
+            "reportReviewStatusDesc": "申诉",
+            "reportReviewResultDesc": "",
+            "reportReviewStatusDescNew": "申诉",
+            "reportReviewResultDescNew": "",
+            "readStatus": 1,
+            "poiReportTime": null,
+            "commentReportRightsType": 0,
+            "commentReportRightsDesc": null,
+            "poiReportRightList": [
+              3,
+              4,
+              5
+            ],
+            "commentReportRightInfoList": [],
+            "isReportRight": false
+          },
+          "modifyInfo": {
+            "days": 14,
+            "limit": 1,
+            "modifiedCount": 0
+          },
+          "environmentLabel": false,
+          "overDeliveryTime": 0,
+          "showOrderInfo": true,
+          "showOrderInfoTime": 48,
+          "eCommentList": [
+            {
+              "id": 4733607573,
+              "type": 0,
+              "cleanComment": "感谢您的好评！您的每一次肯定，都是在为我们加油打气。我们会保持这份热情，用心服务好每一位顾客。",
+              "replyTime": "当天",
+              "ctime": 1792806544,
+              "aiReply": true
+            }
+          ],
+          "userPicUrl": "https://img.meituan.net/avatar/115abf0c424d61332433d37aa4f2c41911256.jpg",
+          "interceptDay": null,
+          "hasAppeal": false,
+          "wmVideoComment": null,
+          "couponFlag": false,
+          "contactCustomerEntrance": 3,
+          "greenHill": "",
+          "topInvalidLeftDay": 0,
+          "auditStatus": 3,
+          "auditNotPassReason": "",
+          "canModify": false,
+          "deliveryCommentShow": true,
+          "cityId": 500100,
+          "cityName": "重庆",
+          "matchComment": null,
+          "overDeliveryStr": "",
+          "bizTagRefund": false,
+          "bizCode": 1,
+          "phfCommentLabels": null,
+          "commentScoreType": 1,
+          "productScore": 5,
+          "commentPreReportInfo": null
+        },
+        {
+          "id": 10219411149,
+          "wmPoiId": 29347390,
+          "poiId": 0,
+          "orderId": 0,
+          "userId": 0,
+          "userName": "G***8",
+          "shipScore": 0,
+          "comment": "这个兔味道很不错，很好吃，性价比也很高",
+          "valid": 1,
+          "ctime": 0,
+          "utime": 0,
+          "shipTime": 0,
+          "cleanComment": "这个兔味道很不错，很好吃，性价比也很高",
+          "commentType": 4,
+          "orderCommentScore": 5,
+          "foodCommentScore": 0,
+          "deliveryCommentScore": 5,
+          "pictureUrls": [],
+          "poiName": "叼叼姐手撕烤兔（长寿菩提古镇店）",
+          "createTime": "2026-10-20",
+          "orderDetails": [
+            {
+              "foodName": "麻辣手撕烤兔冷吃+花生米套餐（1人份）",
+              "count": 1
+            }
+          ],
+          "tasteScore": 5,
+          "qualityScore": 0,
+          "packagingScore": 5,
+          "praiseFoodList": [],
+          "criticFoodList": [],
+          "showReport": 1,
+          "wmCommentReportInfo": {
+            "hasReported": 2,
+            "reportReviewStatus": 0,
+            "reportReadStatus": 0,
+            "reportReviewStatusDesc": "申诉",
+            "reportReviewResultDesc": "",
+            "reportReviewStatusDescNew": "申诉",
+            "reportReviewResultDescNew": "",
+            "readStatus": 1,
+            "poiReportTime": null,
+            "commentReportRightsType": 0,
+            "commentReportRightsDesc": null,
+            "poiReportRightList": [
+              3,
+              4,
+              5
+            ],
+            "commentReportRightInfoList": [],
+            "isReportRight": false
+          },
+          "modifyInfo": {
+            "days": 14,
+            "limit": 1,
+            "modifiedCount": 0
+          },
+          "environmentLabel": false,
+          "overDeliveryTime": 0,
+          "showOrderInfo": true,
+          "showOrderInfoTime": 48,
+          "eCommentList": [
+            {
+              "id": 4728084431,
+              "type": 0,
+              "cleanComment": "感谢您的认可！很高兴您觉得我们的兔菜品味道好、性价比高，期待再次为您服务呀！",
+              "replyTime": "当天",
+              "ctime": 1792546464,
+              "aiReply": true
+            }
+          ],
+          "userPicUrl": "http://p0.meituan.net/scarlett/6b982a09a4916b6810b1342ced20c5b541074.png",
+          "interceptDay": null,
+          "hasAppeal": false,
+          "wmVideoComment": null,
+          "couponFlag": true,
+          "contactCustomerEntrance": 3,
+          "greenHill": "",
+          "topInvalidLeftDay": 0,
+          "auditStatus": 3,
+          "auditNotPassReason": "",
+          "canModify": false,
+          "deliveryCommentShow": true,
+          "cityId": 500100,
+          "cityName": "重庆",
+          "matchComment": null,
+          "overDeliveryStr": "",
+          "bizTagRefund": false,
+          "bizCode": 1,
+          "phfCommentLabels": null,
+          "commentScoreType": 1,
+          "productScore": 5,
+          "commentPreReportInfo": null
+        },
+        {
+          "id": 10219407558,
+          "wmPoiId": 29347390,
+          "poiId": 0,
+          "orderId": 0,
+          "userId": 0,
+          "userName": "C***9",
+          "shipScore": 0,
+          "comment": "这家店的外卖包装干净卫生, 餐品分量非常扎实, 餐品物有所值，很划算, ",
+          "valid": 1,
+          "ctime": 0,
+          "utime": 0,
+          "shipTime": 0,
+          "cleanComment": "这家店的外卖包装干净卫生, 餐品分量非常扎实, 餐品物有所值，很划算, ",
+          "commentType": 11,
+          "orderCommentScore": 5,
+          "foodCommentScore": 0,
+          "deliveryCommentScore": 0,
+          "pictureUrls": [],
+          "poiName": "叼叼姐手撕烤兔（长寿菩提古镇店）",
+          "createTime": "2026-10-20",
+          "orderDetails": [
+            {
+              "foodName": "麻辣手撕烤兔冷吃+花生米套餐（1人份）",
+              "count": 1
+            }
+          ],
+          "tasteScore": 5,
+          "qualityScore": 0,
+          "packagingScore": 5,
+          "praiseFoodList": [],
+          "criticFoodList": [],
+          "showReport": 1,
+          "wmCommentReportInfo": {
+            "hasReported": 2,
+            "reportReviewStatus": 0,
+            "reportReadStatus": 0,
+            "reportReviewStatusDesc": "申诉",
+            "reportReviewResultDesc": "",
+            "reportReviewStatusDescNew": "申诉",
+            "reportReviewResultDescNew": "",
+            "readStatus": 1,
+            "poiReportTime": null,
+            "commentReportRightsType": 0,
+            "commentReportRightsDesc": null,
+            "poiReportRightList": [
+              3,
+              4,
+              5
+            ],
+            "commentReportRightInfoList": [],
+            "isReportRight": false
+          },
+          "modifyInfo": {
+            "days": 14,
+            "limit": 1,
+            "modifiedCount": 0
+          },
+          "environmentLabel": false,
+          "overDeliveryTime": 0,
+          "showOrderInfo": true,
+          "showOrderInfoTime": 48,
+          "eCommentList": [
+            {
+              "id": 4728684482,
+              "type": 0,
+              "cleanComment": "非常感谢您的好评！我们很高兴您对我们的外卖服务和餐品感到满意。您的支持是我们前进的动力，我们会继续努力保持高标准，提供更优质的服务。期待您的下次光临！",
+              "replyTime": "当天",
+              "ctime": 1792578178,
+              "aiReply": false
+            }
+          ],
+          "userPicUrl": "http://p0.meituan.net/scarlett/6b982a09a4916b6810b1342ced20c5b541074.png",
+          "interceptDay": null,
+          "hasAppeal": false,
+          "wmVideoComment": null,
+          "couponFlag": true,
+          "contactCustomerEntrance": 3,
+          "greenHill": "",
+          "topInvalidLeftDay": 0,
+          "auditStatus": 3,
+          "auditNotPassReason": "",
+          "canModify": false,
+          "deliveryCommentShow": true,
+          "cityId": 500100,
+          "cityName": "重庆",
+          "matchComment": null,
+          "overDeliveryStr": "",
+          "bizTagRefund": false,
+          "bizCode": 1,
+          "phfCommentLabels": null,
+          "commentScoreType": 1,
+          "productScore": 5,
+          "commentPreReportInfo": null
+        },
+        {
+          "id": 10219402794,
+          "wmPoiId": 29347390,
+          "poiId": 0,
+          "orderId": 0,
+          "userId": 0,
+          "userName": "小***o",
+          "shipScore": 0,
+          "comment": "“荤素搭配”“菜量充足”“包装精美”很好吃得冷吃兔 分量也可以 也不是很辣 还配了花生米可以解腻 ",
+          "valid": 1,
+          "ctime": 0,
+          "utime": 0,
+          "shipTime": 0,
+          "cleanComment": "“荤素搭配”“菜量充足”“包装精美”很好吃得冷吃兔 分量也可以 也不是很辣 还配了花生米可以解腻 ",
+          "commentType": 4,
+          "orderCommentScore": 5,
+          "foodCommentScore": 0,
+          "deliveryCommentScore": 5,
+          "pictureUrls": [],
+          "poiName": "叼叼姐手撕烤兔（长寿菩提古镇店）",
+          "createTime": "2026-10-20",
+          "orderDetails": [
+            {
+              "foodName": "麻辣手撕烤兔冷吃+花生米套餐（1人份）",
+              "count": 1
+            }
+          ],
+          "tasteScore": 5,
+          "qualityScore": 0,
+          "packagingScore": 5,
+          "praiseFoodList": [],
+          "criticFoodList": [],
+          "showReport": 1,
+          "wmCommentReportInfo": {
+            "hasReported": 2,
+            "reportReviewStatus": 0,
+            "reportReadStatus": 0,
+            "reportReviewStatusDesc": "申诉",
+            "reportReviewResultDesc": "",
+            "reportReviewStatusDescNew": "申诉",
+            "reportReviewResultDescNew": "",
+            "readStatus": 1,
+            "poiReportTime": null,
+            "commentReportRightsType": 0,
+            "commentReportRightsDesc": null,
+            "poiReportRightList": [
+              3,
+              4,
+              5
+            ],
+            "commentReportRightInfoList": [],
+            "isReportRight": false
+          },
+          "modifyInfo": {
+            "days": 14,
+            "limit": 1,
+            "modifiedCount": 0
+          },
+          "environmentLabel": false,
+          "overDeliveryTime": 0,
+          "showOrderInfo": true,
+          "showOrderInfoTime": 48,
+          "eCommentList": [
+            {
+              "id": 4728013476,
+              "type": 0,
+              "cleanComment": "感谢您对冷吃兔的认可，很开心您满意我们的荤素搭配、菜量与包装，期待再次为您服务！",
+              "replyTime": "当天",
+              "ctime": 1792545114,
+              "aiReply": true
+            }
+          ],
+          "userPicUrl": "http://p0.meituan.net/scarlett/6b982a09a4916b6810b1342ced20c5b541074.png",
+          "interceptDay": null,
+          "hasAppeal": false,
+          "wmVideoComment": null,
+          "couponFlag": true,
+          "contactCustomerEntrance": 3,
+          "greenHill": "",
+          "topInvalidLeftDay": 0,
+          "auditStatus": 3,
+          "auditNotPassReason": "",
+          "canModify": false,
+          "deliveryCommentShow": true,
+          "cityId": 500100,
+          "cityName": "重庆",
+          "matchComment": null,
+          "overDeliveryStr": "",
+          "bizTagRefund": false,
+          "bizCode": 1,
+          "phfCommentLabels": null,
+          "commentScoreType": 1,
+          "productScore": 5,
+          "commentPreReportInfo": null
+        }
+      ],
+      "ex": {
+        "poiRightList": "[3,4,5]"
+      }
+    }
+  }
+}

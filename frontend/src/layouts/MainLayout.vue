@@ -45,6 +45,23 @@
         </el-menu-item>
       </el-menu>
 
+      <!-- 连接浏览器：执行自动化前提前登录美团 -->
+      <div class="sidebar-browser">
+        <el-button
+          class="browser-btn"
+          size="small"
+          type="primary"
+          plain
+          :loading="browserConnecting"
+          @click="connectBrowser"
+        >
+          连接浏览器
+        </el-button>
+        <div class="browser-state" :class="browserLoggedIn ? 'ok' : 'warn'">
+          <span class="state-dot"></span>{{ browserLoggedIn ? '美团已登录' : '美团未登录' }}
+        </div>
+      </div>
+
       <div class="sidebar-footer">
         <div class="user-info">
           <div class="user-avatar">
@@ -94,10 +111,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { useAuthStore } from '../stores/auth'
 import { useShopStore } from '../stores/shop'
+import { browserApi } from '../api/browser'
 import { AccountStatus, ACCOUNT_STATUS_LABELS } from '../types/user'
 
 const route = useRoute()
@@ -145,7 +164,50 @@ const handleLogout = () => {
   router.push('/login')
 }
 
+// 浏览器连接状态：执行自动化前需确保已连接浏览器并登录美团
+const browserLoggedIn = ref(false)
+const browserConnecting = ref(false)
+let browserTimer: number | undefined
+
+const refreshBrowserState = async () => {
+  try {
+    const st = await browserApi.checkLoginStatus()
+    browserLoggedIn.value = st.loggedIn
+  } catch {
+    browserLoggedIn.value = false
+  }
+}
+
+const connectBrowser = async () => {
+  browserConnecting.value = true
+  try {
+    await browserApi.startLogin()
+    ElMessage.success('浏览器已打开，请在浏览器中完成美团登录')
+    // 轮询最多 60 秒，登录成功后更新状态
+    for (let i = 0; i < 10; i++) {
+      await new Promise(resolve => setTimeout(resolve, 6000))
+      try {
+        const st = await browserApi.checkLoginStatus()
+        if (st.loggedIn) {
+          browserLoggedIn.value = true
+          ElMessage.success('美团已登录，可以执行自动化了')
+          break
+        }
+      } catch {
+        // 轮询期间的网络抖动忽略，继续等待
+      }
+      if (i === 9) ElMessage.warning('尚未检测到登录，请在浏览器中完成美团登录后再执行自动化')
+    }
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.message || '启动浏览器失败，请确认程序与浏览器环境正常')
+  } finally {
+    browserConnecting.value = false
+  }
+}
+
 onMounted(async () => {
+  refreshBrowserState()
+  browserTimer = window.setInterval(refreshBrowserState, 60000)
   // Don't fetch if already loaded
   if (!authStore.user && authStore.token) {
     try {
@@ -160,6 +222,9 @@ onMounted(async () => {
   } catch (error) {
     console.error('Failed to fetch shops:', error)
   }
+})
+onUnmounted(() => {
+  if (browserTimer) window.clearInterval(browserTimer)
 })
 </script>
 
@@ -203,6 +268,41 @@ onMounted(async () => {
   flex: 1;
   border: none;
   padding: 12px 0;
+}
+
+/* 侧边栏：连接浏览器 */
+.sidebar-browser {
+  padding: 8px 16px 12px;
+  border-top: 1px solid var(--color-border);
+  margin-top: 4px;
+}
+
+.browser-btn {
+  width: 100%;
+}
+
+.browser-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #909399;
+}
+
+.browser-state.ok {
+  color: #67c23a;
+}
+
+.browser-state.warn {
+  color: #e6a23c;
+}
+
+.state-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .sidebar-footer {

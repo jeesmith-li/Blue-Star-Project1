@@ -87,6 +87,46 @@ public class AutomationController {
         }
     }
 
+    /**
+     * 仅对指定店铺执行一次自动化流水线：
+     * 抓取评价（2 小时内已抓取/已执行过自动化则跳过抓取）→ 自动回复 → 差评申诉 → 申诉回查
+     * → 食安抓取 → 食安自动申诉 → 食安回查
+     */
+    @PostMapping("/shop/{shopId}")
+    public ResponseEntity<Map<String, Object>> startShop(
+            @PathVariable Long shopId,
+            @RequestHeader(value = "Authorization", required = false) String authHeader) {
+
+        Map<String, Object> response = new HashMap<>();
+
+        try {
+            String token = jwtUtil.extractTokenFromHeader(authHeader);
+            String username = jwtUtil.extractUsername(token);
+            User user = authService.getCurrentUser(username);
+
+            // 管理员可操作全部店铺；普通用户只能操作自己名下店铺
+            Long userId = user.getRole() == User.UserRole.ADMIN ? null : user.getId();
+            Map<String, Object> result = dailyCaptureScheduler.runForShop(shopId, "单店手动(" + username + ")", userId);
+
+            if ("SHOP_NOT_FOUND".equals(result.get("code"))) {
+                response.put("success", false);
+                response.put("code", "SHOP_NOT_FOUND");
+                response.put("message", result.get("message"));
+                response.put("detail", result);
+                return ResponseEntity.badRequest().body(response);
+            }
+            response.put("success", result.getOrDefault("success", false));
+            response.put("message", String.valueOf(result.get("message")));
+            response.put("detail", result);
+            return ResponseEntity.ok(response);
+
+        } catch (Exception e) {
+            response.put("success", false);
+            response.put("message", "启动失败: " + e.getMessage());
+            return ResponseEntity.status(500).body(response);
+        }
+    }
+
     @PostMapping("/stop")
     public ResponseEntity<Map<String, Object>> stop() {
         Map<String, Object> response = new HashMap<>();

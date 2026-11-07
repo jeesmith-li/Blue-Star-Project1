@@ -1,0 +1,1 @@
+import{x as n}from"./index-BatDwtiB.js";function o(t){var e;const a=(e=t==null?void 0:t.response)==null?void 0:e.data;return!a||a.code!=="SHOP_NOT_FOUND"?!1:(n.alert(a.message||"该店铺暂未寻到，请重新执行","店铺未找到",{type:"warning",confirmButtonText:"知道了"}),!0)}export{o as a};

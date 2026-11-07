@@ -1,6 +1,7 @@
 package com.example.meituan.web.entity;
 
 import jakarta.persistence.*;
+import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "shops")
@@ -26,6 +27,12 @@ public class Shop {
     private String status = "active";
 
     private String lastSyncTime;
+
+    /** 最近一次评价抓取时间：单店自动化 2 小时复用窗口判断用 */
+    private LocalDateTime lastScrapeTime;
+
+    /** 最近一次自动化执行完成时间：单店自动化 2 小时复用窗口判断用 */
+    private LocalDateTime lastAutomationTime;
 
     @Column(nullable = false)
     private Integer todayBadReviews = 0;
@@ -200,5 +207,21 @@ public class Shop {
 
     public void setSortOrder(Integer sortOrder) {
         this.sortOrder = sortOrder;
+    }
+
+    public LocalDateTime getLastScrapeTime() {
+        return lastScrapeTime;
+    }
+
+    public void setLastScrapeTime(LocalDateTime lastScrapeTime) {
+        this.lastScrapeTime = lastScrapeTime;
+    }
+
+    public LocalDateTime getLastAutomationTime() {
+        return lastAutomationTime;
+    }
+
+    public void setLastAutomationTime(LocalDateTime lastAutomationTime) {
+        this.lastAutomationTime = lastAutomationTime;
     }
 }
