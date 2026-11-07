@@ -12,8 +12,14 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @Service
@@ -108,6 +114,7 @@ public class ReviewService {
      * 手动标记已回复：支持单条(id)、批量(ids)、整店全部(shopId)，返回实际更新条数。
      * 已是"replied"的记录跳过，避免覆盖真实回复时间。
      */
+    @Transactional
     public int markReplied(Long id, List<Long> ids, Long shopId) {
         List<Review> targets;
         if (ids != null && !ids.isEmpty()) {
@@ -119,16 +126,18 @@ public class ReviewService {
         } else {
             return 0;
         }
-        int n = 0;
+        List<Review> changed = new ArrayList<>();
         for (Review r : targets) {
             if (!"replied".equals(r.getReplyStatus())) {
                 r.setReplyStatus("replied");
                 r.setReplyTime(java.time.LocalDateTime.now());
-                reviewRepository.save(r);
-                n++;
+                changed.add(r);
             }
         }
-        return n;
+        if (!changed.isEmpty()) {
+            reviewRepository.saveAll(changed);
+        }
+        return changed.size();
     }
 
     /**
@@ -153,21 +162,31 @@ public class ReviewService {
     /**
      * 将抓取到的评价去重入库（按 shopId + platformReviewId），返回新增条数
      */
+    @Transactional
     public int saveScrapedReviews(Long shopId, String shopName, List<java.util.Map<String, Object>> reviews) {
-        if (reviews == null) return 0;
+        if (reviews == null || reviews.isEmpty()) return 0;
+        // 一次查出该店已有评价，内存去重后批量写入：几百条评价从 N 次查询 + N 次事务降为 1 次查询 + 1 次事务
+        Map<String, Review> existingByPlatformId = new HashMap<>();
+        for (Review r : reviewRepository.findByShopId(shopId, Pageable.unpaged()).getContent()) {
+            if (r.getPlatformReviewId() != null) {
+                existingByPlatformId.put(r.getPlatformReviewId(), r);
+            }
+        }
         int added = 0;
+        Set<Review> toSave = new LinkedHashSet<>();
         for (java.util.Map<String, Object> r : reviews) {
             String platformId = str(r.get("platformReviewId"));
-            Review existing = null;
-            if (!platformId.isEmpty()) {
-                existing = reviewRepository.findByShopIdAndPlatformReviewId(shopId, platformId).orElse(null);
-            }
+            Review existing = platformId.isEmpty() ? null : existingByPlatformId.get(platformId);
             Review review = existing != null ? existing : new Review();
             if (existing == null) {
                 review.setShopId(shopId);
                 review.setShopName(shopName);
                 review.setPlatformReviewId(platformId.isEmpty() ? ("local_" + System.nanoTime()) : platformId);
                 review.setCreatedAt(java.time.LocalDateTime.now());
+                if (!platformId.isEmpty()) {
+                    existingByPlatformId.put(platformId, review);
+                }
+                added++;
             }
             review.setReviewer(str(r.get("reviewer")));
             Integer rating = toInt(r.get("rating"));
@@ -179,8 +198,10 @@ public class ReviewService {
             review.setReplyContent(str(r.get("replyContent")));
             String rt = str(r.get("replyTime"));
             review.setReplyTime(rt.isEmpty() ? null : parseTime(rt));
-            reviewRepository.save(review);
-            if (existing == null) added++;
+            toSave.add(review);
+        }
+        if (!toSave.isEmpty()) {
+            reviewRepository.saveAll(toSave);
         }
         return added;
     }
