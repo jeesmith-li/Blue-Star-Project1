@@ -142,6 +142,7 @@ import { useAutomationStore } from '../stores/automation'
 import { useShopStore } from '../stores/shop'
 import { automationApi, type AutomationConfigData } from '../api/automation'
 import { shopsApi } from '../api/shops'
+import { browserApi } from '../api/browser'
 import { alertIfShopNotFound } from '../utils/shopError'
 import type { Shop } from '../types/shop'
 
@@ -272,7 +273,38 @@ const stopPolling = () => {
   }
 }
 
+// 执行自动化前检查浏览器连接：未连接/未登录时提示并引导点击「连接浏览器」
+const promptConnectBrowser = async (detail?: string) => {
+  try {
+    await ElMessageBox.confirm(
+      detail || '当前未连接到浏览器，或浏览器尚未登录美团。请先点击左侧「连接浏览器」按钮，在打开的浏览器中完成美团登录后再执行自动化。',
+      '请先连接浏览器',
+      { confirmButtonText: '连接浏览器', cancelButtonText: '知道了', type: 'warning' }
+    )
+  } catch {
+    return false
+  }
+  try {
+    await browserApi.startLogin()
+    ElMessage.success('浏览器已打开，请在浏览器中完成美团登录后再执行自动化')
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.message || '启动浏览器失败，请确认程序运行正常')
+  }
+  return false
+}
+
+const ensureBrowserConnected = async (): Promise<boolean> => {
+  try {
+    const st = await browserApi.checkLoginStatus()
+    if (st.loggedIn) return true
+  } catch {
+    // 查询失败按“未连接”处理，统一走下面的提示
+  }
+  return promptConnectBrowser()
+}
+
 const handleStart = async () => {
+  if (!(await ensureBrowserConnected())) return
   try {
     await ElMessageBox.confirm(
       `将按当前执行顺序逐店处理，共 ${orderList.value.length} 家店铺。每家店铺依次执行：抓取评价 → 自动回复 → 差评申诉 → 申诉回查 → 食安抓取 → 食安自动申诉 → 食安回查。执行期间请不要操作美团浏览器窗口。`,
@@ -294,6 +326,7 @@ const handleStart = async () => {
       foodSafetySubmitted: 0
     }
     if (resp?.success) ElMessage.success(resp.message || '自动流水线执行完成')
+    else if (resp?.detail?.resultType === 'SKIP_BROWSER') await promptConnectBrowser(resp?.message)
     else ElMessage.warning(resp?.message || '执行完成（部分失败）')
   } catch (error: any) {
     if (error !== 'cancel' && !alertIfShopNotFound(error)) {
@@ -307,6 +340,7 @@ const handleStart = async () => {
 
 // 单店执行：仅对一家店铺跑一次完整流水线
 const runShop = async (s: Shop) => {
+  if (!(await ensureBrowserConnected())) return
   try {
     await ElMessageBox.confirm(
       `仅对「${s.name}」执行一次自动化：抓取评价（2 小时内已抓取或已执行过自动化则跳过抓取）→ 自动回复 → 差评申诉 → 申诉回查 → 食安抓取 → 食安自动申诉 → 食安回查。执行期间请不要操作美团浏览器窗口。`,
@@ -325,6 +359,7 @@ const runShop = async (s: Shop) => {
       message: resp?.message
     }
     if (resp?.success) ElMessage.success(resp.message || `店铺「${s.name}」执行完成`)
+    else if (resp?.detail?.resultType === 'SKIP_BROWSER') await promptConnectBrowser(resp?.message)
     else ElMessage.warning(resp?.message || '执行完成（部分失败）')
   } catch (error: any) {
     if (!alertIfShopNotFound(error)) {
