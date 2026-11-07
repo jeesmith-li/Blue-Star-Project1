@@ -1387,7 +1387,7 @@ def cmd_scrape_reviews(args):
             page.keyboard.press("End")
         except Exception:
             pass
-        time.sleep(1)
+        page.wait_for_timeout(300)
 
         # 从第一页响应解析总条数 → 总页数
         total_pages = 0
@@ -1452,10 +1452,11 @@ def cmd_scrape_reviews(args):
         for step in range(max_loops):
             _refresh_pages()
             cur = max(pages_seen) if pages_seen else 1
-            if total_pages and cur >= total_pages:
-                log(f"已抓取全部 {total_pages} 页，停止翻页")
+            missing_pages = sorted(set(range(1, total_pages + 1)) - pages_seen) if total_pages else []
+            if total_pages and not missing_pages:
+                log(f"已逐页核对全部 {total_pages} 页，停止翻页")
                 break
-            target = cur + 1
+            target = missing_pages[0] if missing_pages else cur + 1
             before_pages = set(pages_seen)
             before_cnt = len(captured)
             pt, mode = _pager_point_for(page, target, shot_path)
@@ -1489,6 +1490,11 @@ def cmd_scrape_reviews(args):
         page.remove_listener("response", _on_resp)
         log(f"抓取资源已释放，耗时={time.monotonic() - capture_started:.2f}s，响应数={len(captured)}")
 
+    missing_pages = sorted(set(range(1, total_pages + 1)) - pages_seen) if total_pages else []
+    if missing_pages:
+        log(f"抓取不完整: 缺少页码={missing_pages}")
+        send({"type": "error", "message": f"评价未抓全：预计{total_pages}页，缺少{missing_pages}。未将本次部分数据标记为成功，请检查浏览器和日志后重试"})
+        return
     reviews = []
     seen = set()
     import json as _json
@@ -1706,6 +1712,14 @@ def cmd_run_appeal(args):
             if not _prepare_review_capture(page, captured, shop_name):
                 send({"type": "error", "message": "目标店铺评价列表未就绪，未执行申诉"})
                 return
+            if not _reply_rating(page, 1, captured):
+                send({"type": "error", "message": "未确认差评筛选后的新列表，已停止申诉"})
+                return
+            rows, _ = _extract_reviews_from_json(json.loads(captured[-1]))
+            if any(r.get("rating") not in (1, 2) for r in rows):
+                send({"type": "error", "message": "筛选结果包含非差评，已停止申诉"})
+                return
+            log("申诉导航: 已切换差评筛选并收到新列表")
         finally:
             page.remove_listener("response", capture_list)
         if not _click_target_appeal(page, content):
@@ -2606,14 +2620,14 @@ def _list_btn_min_x(page):
     return vw * 0.55
 
 
-def _click_reply_button_for(page, review, k):
+def _click_reply_button_for(page, review, k, page_reviews=None):
     """定位并点击目标评价的「回复」按钮，并确认编辑器展开。
     评价卡片由 Flutter canvas 绘制（DOM 里只有绘制产物、无事件处理器，元素点击无效），
     唯一可靠路径：OCR 放大定位按钮坐标 → CDP 可信鼠标点击（带抖动重试，OCR 确认编辑器出现）。
     定位优先按评价内容文本锚定（内容下方最近的「回复」按钮即同卡片按钮）；
-    OCR 读不出内容时退化为第 k 个可见按钮（仅未滚动的首屏有效）。
+    根据同页文字间距小步滚动，文字不唯一时不按按钮序号猜测。
     返回 (是否已点开编辑器, None)"""
-    key = ((review.get("content") or "").strip())[:10]
+    key = re.sub(r"\s+", "", review.get("content") or "")[:16]
     # 0) 清理可能残留的旧编辑器，避免把旧编辑器误判为本目标已点开
     try:
         st = _editor_open_pos(page, "stale")
@@ -2624,38 +2638,40 @@ def _click_reply_button_for(page, review, k):
     except Exception:
         pass
     btn = None
-    for attempt in range(6):
+    for attempt in range(24):
         boxes = _ocr_zone(page, f"loc{attempt}", x_frac0=0.2, scale=2)
         min_x = _list_btn_min_x(page)
-        btns = sorted([(x, y) for t, x, y in boxes if t == "回复" and x > min_x],
-                      key=lambda c: c[1])
-        anchor_y = None
-        if len(key) >= 6:
-            for t, x, y in boxes:
-                if len(t) >= 4 and (key[:4] in t or t[:4] in key):
-                    anchor_y = y
-                    break
+        anchors = [(x, y) for t, x, y in boxes
+                   if len(key) >= 6 and key in re.sub(r"\s+", "", t)]
+        anchor_y = anchors[0][1] if len(anchors) == 1 else None
+        known_y = []
+        for row in page_reviews or [review]:
+            fragment = re.sub(r"\s+", "", row.get("content") or "")[:16]
+            hits = [y for t, x, y in boxes if len(fragment) >= 6
+                    and fragment in re.sub(r"\s+", "", t)]
+            if len(hits) == 1:
+                known_y.append(hits[0])
+        known_y = sorted(set(known_y))
+        gaps = [b - a for a, b in zip(known_y, known_y[1:]) if b - a > 40]
         if anchor_y is not None:
-            below = [b for b in btns if b[1] > anchor_y]
-            if below:
-                btn = below[0]
-                log(f"内容锚定目标卡片「回复」按钮(k={k} key={key[:8]}… 坐标=({btn[0]},{btn[1]}))")
+            boundaries = [y for y in known_y if y > anchor_y]
+            boundaries += [y for t, x, y in boxes
+                           if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t.strip()) and y > anchor_y]
+            bottom = min(boundaries) if boundaries else float("inf")
+            candidates = [(x, y) for t, x, y in boxes
+                          if t == "回复" and x > min_x and anchor_y < y < bottom]
+            if len(candidates) == 1:
+                btn = candidates[0]
+                log(f"目标文字与卡片边界匹配，定位回复按钮: {review.get('platformReviewId')}")
                 break
-        if attempt == 0 and anchor_y is None and len(btns) > k:
-            btn = btns[k]
-            log(f"第{k}个可见「回复」按钮(坐标=({btn[0]},{btn[1]}))")
-            break
-        # 目标不在视口内：滚动评价列表后重试（滚轮必须落在卡片列表上，
-        # 筛选面板区域不响应滚轮）
-        try:
-            vw = page.evaluate("() => window.innerWidth || 800")
-            vh = page.evaluate("() => window.innerHeight || 600")
-        except Exception:
-            vw, vh = 800, 600
-        page.mouse.move(vw * 0.6, vh * 0.8)
-        page.wait_for_timeout(200)
-        page.mouse.wheel(0, 600)
-        page.wait_for_timeout(1000)
+        viewport = page.evaluate("() => ({width:innerWidth,height:innerHeight})")
+        step = min(220, viewport["height"] * 0.18, min(gaps) * 0.4 if gaps else 180)
+        if anchor_y is not None:
+            step = min(step, 80, max(20, anchor_y * 0.3))
+        log(f"回复定位第{attempt + 1}轮: 目标文字={anchor_y is not None}, 间距={gaps}, 滚动={step:.0f}")
+        page.mouse.move(viewport["width"] * 0.6, viewport["height"] * 0.8)
+        page.mouse.wheel(0, step)
+        page.wait_for_timeout(300)
     if not btn:
         log(f"目标评价「回复」按钮未定位到(k={k} key={key[:8]}…)")
         return False, None
@@ -2925,6 +2941,70 @@ def _rpa_reply_one(page, reply_events, text, card_eh=None, expect_pid=None):
     return False, "提交后未捕获到回复接口响应（超时）"
 
 
+def _reply_search(page, keyword, responses):
+    """Change the actual search field and require a newly received list."""
+    before = len(responses)
+    for frame in page.frames:
+        try:
+            field = frame.get_by_placeholder("关键词搜索", exact=True)
+            if field.count() == 1 and field.is_visible():
+                field.fill(keyword, timeout=1500)
+                field.press("Enter", timeout=1500)
+                break
+        except Exception:
+            continue
+    else:
+        # Canvas field must first be focused; never type into an unknown editor.
+        boxes = _ocr_pick(page, ["关键词搜索"])
+        matches = [(x, y) for t, x, y in boxes if t.strip() == "关键词搜索"]
+        if len(matches) != 1:
+            return False
+        page.mouse.click(*matches[0])
+        for frame in page.frames:
+            field = frame.locator("input:focus, textarea:focus")
+            if field.count() == 1:
+                field.fill(keyword, timeout=1500)
+                field.press("Enter", timeout=1500)
+                break
+        else:
+            return False
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if len(responses) > before:
+            return True
+        page.wait_for_timeout(100)
+    return False
+
+
+def _reply_rating(page, rating, responses):
+    label = "差评" if rating in (1, 2) else "中评" if rating == 3 else "好评" if rating in (4, 5) else None
+    if label is None:
+        return False
+    before = len(responses)
+    clicked = False
+    for frame in page.frames:
+        try:
+            loc = frame.get_by_text(re.compile("^" + label + r"[（(]"))
+            if loc.count() == 1 and loc.is_visible():
+                loc.click(timeout=1500)
+                clicked = True
+                break
+        except Exception:
+            continue
+    if not clicked:
+        matches = [(x, y) for t, x, y in _ocr_pick(page, [label])
+                   if re.match("^" + label + r"[（(]", t)]
+        if len(matches) != 1:
+            return False
+        page.mouse.click(*matches[0])
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if len(responses) > before:
+            return True
+        page.wait_for_timeout(100)
+    return False
+
+
 def cmd_reply_reviews(args):
     """批量回复评价（RPA 模式，对标西瓜本地客户端）：
     OCR 定位「回复/提交」按钮 + CDP 键鼠注入，全程不占用用户鼠标、无需窗口置顶。
@@ -3032,41 +3112,46 @@ def cmd_reply_reviews(args):
             return
         log(f"回复导航就绪，耗时={time.monotonic() - started:.2f}s")
 
-        MAX_PAGES = 5
-        log(f"待回复目标: {list(text_map.keys())}")
-        for page_no in range(1, MAX_PAGES + 1):
-            if len(done_ids) >= len(text_map):
-                break
-            ordered = list(page_rows)
-            unreplied_all = [r for r in ordered if r.get("replyStatus") != "replied"]
-            targets = [r for r in unreplied_all
-                       if r["platformReviewId"] in text_map
-                       and r["platformReviewId"] not in done_ids]
-            log(f"第{page_no}页: 本页rows={len(ordered)} 未回={len(unreplied_all)}"
-                f" 目标命中={len(targets)}")
-            if targets:
-                for tgt in targets:
-                    prid = tgt["platformReviewId"]
-                    k = unreplied_all.index(tgt)
-                    opened, card_eh = _click_reply_button_for(page, tgt, k)
-                    if not opened:
-                        log(f"目标 {prid} 未能定位「回复」按钮，本页放弃")
+        # Keep the existing ID-based reply and submission confirmation for every target.
+        for item in sorted(items, key=lambda it: int(it.get("rating") or 0)):
+            prid = str(item.get("platformReviewId") or "")
+            if prid not in text_map or prid in done_ids:
+                continue
+            rating = int(item.get("rating") or 0)
+            fragments = re.findall(r"[\w\u4e00-\u9fff]{4,}", item.get("content") or "")
+            keyword = max(fragments, key=len)[:12] if fragments else ""
+            _reply_rating(page, rating, navigation_responses)
+            found = None
+            if len(keyword) >= 4 and _reply_search(page, keyword, navigation_responses):
+                found = next((r for r in page_rows if r["platformReviewId"] == prid), None)
+            if found is None:
+                # Clearing must succeed before using any fallback page data.
+                if not _reply_search(page, "", navigation_responses):
+                    results.append({"platformReviewId": prid, "success": False,
+                                    "message": "搜索条件未能清除或未收到新列表，已停止该条回复"})
+                    continue
+                for page_no in range(1, 101):
+                    found = next((r for r in page_rows if r["platformReviewId"] == prid), None)
+                    if found is not None:
                         break
-                    ok, msg = _rpa_reply_one(page, reply_events, text_map[prid],
-                                             card_eh=card_eh, expect_pid=prid)
-                    results.append({"platformReviewId": prid, "success": ok, "message": msg})
-                    if ok:
-                        done_ids.add(prid)
-                        latest[prid]["replyStatus"] = "replied"
-                    log(f"RPA回复 {prid}: {'成功' if ok else '失败'} - {msg}")
-                    # 防频控间隔
-                    if len(done_ids) < len(text_map):
-                        page.wait_for_timeout(1500 + (len(done_ids) * 3 % 4) * 500)
-            if len(done_ids) >= len(text_map):
-                break
-            if page_no < MAX_PAGES:
-                if not _rpa_goto_page(page, page_no + 1):
-                    break
+                    before = len(navigation_responses)
+                    if not _rpa_goto_page(page, page_no + 1):
+                        break
+                    deadline = time.monotonic() + 8
+                    while len(navigation_responses) == before and time.monotonic() < deadline:
+                        page.wait_for_timeout(100)
+                    if len(navigation_responses) == before:
+                        break
+            if found is None or found.get("replyStatus") == "replied":
+                continue
+            opened, card_eh = _click_reply_button_for(page, found, 0, list(page_rows))
+            if not opened:
+                results.append({"platformReviewId": prid, "success": False, "message": "未定位目标回复按钮"})
+                continue
+            ok, msg = _rpa_reply_one(page, reply_events, text_map[prid], card_eh=card_eh, expect_pid=prid)
+            results.append({"platformReviewId": prid, "success": ok, "message": msg})
+            done_ids.add(prid)  # Never resubmit an uncertain result within the batch.
+            page.wait_for_timeout(1500)
     finally:
         try:
             page.remove_listener("response", _on_resp)
