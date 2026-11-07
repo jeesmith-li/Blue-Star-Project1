@@ -1390,6 +1390,16 @@ def _extract_reviews_from_json(obj):
         for e in (o.get("eCommentList") or []):
             if not isinstance(e, dict):
                 continue
+            # eCommentList 同时承载「商家回复」和「顾客追评」：
+            # type=0 为商家回复；type=1 为顾客追评（顾客追加评价，不能算作已回复）
+            etype = e.get("type", 0)
+            try:
+                etype_int = int(etype)
+            except Exception:
+                etype_int = 0
+            if etype_int != 0:
+                log(f"评价 {o.get('id')} 的 eCommentList 含 type={etype}（顾客追评），不计入商家回复")
+                continue
             rc2 = pick(e, ("cleanComment", "comment", "content", "replyContent"))
             if rc2:
                 # 真实回复时间取 ctime 秒级时间戳；"7天后"这类相对展示串不采用
