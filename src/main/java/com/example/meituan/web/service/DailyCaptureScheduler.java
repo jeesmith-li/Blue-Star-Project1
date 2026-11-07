@@ -30,6 +30,9 @@ public class DailyCaptureScheduler {
     private static final Logger logger = LoggerFactory.getLogger(DailyCaptureScheduler.class);
     private static final String OPERATOR = "system";
 
+    /** 单店自动化复用窗口：2 小时内已抓取或已执行过自动化时，本次不再重复抓取评价 */
+    private static final long SHOP_REUSE_WINDOW_HOURS = 2;
+
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     @Autowired
@@ -123,6 +126,166 @@ public class DailyCaptureScheduler {
         }
     }
 
+    /**
+     * 仅对指定店铺执行一次自动化流水线：
+     * 抓取评价（2 小时内已抓取/已执行过自动化则跳过抓取）→ 自动回复 → 差评申诉 → 申诉回查
+     * → 食安抓取 → 食安自动申诉 → 食安回查
+     * @param userId 非空时校验店铺归属（普通用户只能操作自己名下店铺）
+     */
+    public Map<String, Object> runForShop(Long shopId, String trigger, Long userId) {
+        if (!running.compareAndSet(false, true)) {
+            clientLogService.info("scheduler", OPERATOR, "单店自动化跳过", "上一次任务仍在执行中，本次(" + trigger + ")跳过");
+            return Map.of("success", false, "message", "上一次自动流水线仍在执行中，请稍后再试");
+        }
+        try {
+            return doRunForShop(shopId, trigger, userId);
+        } finally {
+            running.set(false);
+        }
+    }
+
+    private Map<String, Object> doRunForShop(Long shopId, String trigger, Long userId) {
+        long start = System.currentTimeMillis();
+        Shop shop = shopRepository.findById(shopId).orElse(null);
+        if (shop == null || (userId != null && !userId.equals(shop.getUserId()))) {
+            String msg = "该店铺暂未寻到或无权操作（shopId=" + shopId + "）";
+            clientLogService.error("scheduler", OPERATOR, "单店自动化跳过", msg);
+            Map<String, Object> r = new LinkedHashMap<>();
+            r.put("success", false);
+            r.put("code", "SHOP_NOT_FOUND");
+            r.put("message", msg);
+            return r;
+        }
+
+        boolean loggedIn;
+        try {
+            loggedIn = browserService.checkLogin();
+        } catch (Exception e) {
+            loggedIn = false;
+            logger.warn("[SCHEDULER] 单店登录检查异常: {}", e.getMessage());
+        }
+        if (!loggedIn) {
+            String detail = "浏览器未连接或未登录美团，本次单店自动化(" + shop.getName() + ")跳过";
+            clientLogService.error("scheduler", OPERATOR, "单店自动化跳过", detail);
+            Map<String, Object> r = new LinkedHashMap<>();
+            r.put("success", false);
+            r.put("resultType", "SKIP_BROWSER");
+            r.put("message", detail);
+            return r;
+        }
+
+        int fetched = 0, added = 0, replied = 0, replyFailed = 0;
+        int appealCandidates = 0, appealSubmitted = 0, appealUpdated = 0;
+        int fsScraped = 0, fsSubmitted = 0, fsChecked = 0;
+        boolean scrapeSkipped = false;
+        String skipReason = null;
+        try {
+            // 2 小时复用窗口：最近抓取或最近自动化在 2 小时内，本次不重复抓取评价
+            LocalDateTime last = shop.getLastScrapeTime();
+            if (shop.getLastAutomationTime() != null && (last == null || shop.getLastAutomationTime().isAfter(last))) {
+                last = shop.getLastAutomationTime();
+            }
+            if (last != null && last.isAfter(LocalDateTime.now().minusHours(SHOP_REUSE_WINDOW_HOURS))) {
+                scrapeSkipped = true;
+                skipReason = "最近一次抓取/自动化时间为 " + last + "，在 " + SHOP_REUSE_WINDOW_HOURS + " 小时内，本次不重复抓取评价";
+                logger.info("[SCHEDULER] 单店{}跳过抓取: {}", shop.getId(), skipReason);
+            }
+
+            if (!scrapeSkipped) {
+                Map<String, Object> res = browserService.scrapeReviews(shop.getName());
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> reviews = (List<Map<String, Object>>) res.get("reviews");
+                fetched = reviews == null ? 0 : reviews.size();
+                added = reviewService.saveScrapedReviews(shop.getId(), shop.getName(), reviews);
+                shop.setLastScrapeTime(LocalDateTime.now());
+                shopRepository.save(shop);
+            }
+
+            if (Boolean.TRUE.equals(shop.getAutoReplyEnabled())) {
+                Map<String, Object> rr = replyExecutionService.autoReplyForShop(shop, OPERATOR);
+                replied = (int) rr.getOrDefault("replied", 0);
+                replyFailed = (int) rr.getOrDefault("failed", 0);
+            }
+
+            if (Boolean.TRUE.equals(shop.getAppealAutoEnabled())) {
+                Map<String, Object> ap = appealService.autoRunForShop(shop, OPERATOR);
+                if ("SHOP_NOT_FOUND".equals(ap.get("code"))) {
+                    throw new ShopNotFoundException(String.valueOf(ap.get("message")));
+                }
+                appealCandidates = (int) ap.getOrDefault("candidates", 0);
+                appealSubmitted = (int) ap.getOrDefault("submitted", 0);
+            }
+
+            Map<String, Object> ck = appealService.checkResultsForShop(shop);
+            if ("SHOP_NOT_FOUND".equals(ck.get("code"))) {
+                throw new ShopNotFoundException(String.valueOf(ck.get("message")));
+            }
+            appealUpdated = (int) ck.getOrDefault("updated", 0);
+
+            if (Boolean.TRUE.equals(shop.getFoodSafetyAutoAppeal())) {
+                Map<String, Object> sc = foodSafetyService.scrape(shop.getId(), OPERATOR);
+                fsScraped = (int) sc.getOrDefault("added", 0);
+                Map<String, Object> ap = foodSafetyService.autoAppeal(shop.getId(), OPERATOR);
+                fsSubmitted = (int) ap.getOrDefault("submitted", 0);
+                Map<String, Object> fsCk = foodSafetyService.checkStatus(shop.getId(), OPERATOR);
+                fsChecked = (int) fsCk.getOrDefault("updated", 0);
+            }
+
+            shop.setLastAutomationTime(LocalDateTime.now());
+            shopRepository.save(shop);
+
+            long cost = System.currentTimeMillis() - start;
+            boolean hasFailure = replyFailed > 0;
+            String summary = String.format(
+                    "触发:%s | 店铺:%s | 抓取:%s | 评价: 抓到%d 入库%d | 自动回复: 成功%d 失败%d | 申诉: 候选%d 提交%d 回查更新%d | 食安: 抓%d 申%d 回查%d | 耗时%d秒",
+                    trigger, shop.getName(), scrapeSkipped ? "跳过(2小时内已抓取/已执行)" : "执行",
+                    fetched, added, replied, replyFailed, appealCandidates, appealSubmitted, appealUpdated,
+                    fsScraped, fsSubmitted, fsChecked, cost / 1000);
+            if (hasFailure) {
+                clientLogService.error("scheduler", OPERATOR, "单店自动化完成(部分失败)", summary);
+            } else {
+                clientLogService.info("scheduler", OPERATOR, "单店自动化完成", summary);
+            }
+            logger.info("[SCHEDULER] {}", summary);
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("success", !hasFailure);
+            result.put("resultType", hasFailure ? "PARTIAL" : "SUCCESS");
+            result.put("message", summary);
+            result.put("shopId", shop.getId());
+            result.put("shopName", shop.getName());
+            result.put("scrapeSkipped", scrapeSkipped);
+            result.put("scrapeSkipReason", skipReason);
+            result.put("reviewsFetched", fetched);
+            result.put("reviewsAdded", added);
+            result.put("replied", replied);
+            result.put("replyFailed", replyFailed);
+            result.put("appealCandidates", appealCandidates);
+            result.put("appealSubmitted", appealSubmitted);
+            result.put("appealStatusUpdated", appealUpdated);
+            result.put("foodSafetyScraped", fsScraped);
+            result.put("foodSafetySubmitted", fsSubmitted);
+            result.put("foodSafetyChecked", fsChecked);
+            return result;
+        } catch (ShopNotFoundException sne) {
+            String msg = "该店铺暂未寻到：" + shop.getName() + "，已停止本次单店自动化，请重新执行";
+            clientLogService.error("scheduler", OPERATOR, "单店自动化中止(店铺未找到)", msg);
+            Map<String, Object> r = new LinkedHashMap<>();
+            r.put("success", false);
+            r.put("code", "SHOP_NOT_FOUND");
+            r.put("message", msg);
+            return r;
+        } catch (Exception e) {
+            String msg = "店铺[" + shop.getName() + "]单店自动化失败: " + e.getMessage();
+            clientLogService.error("scheduler", OPERATOR, "单店自动化失败", msg);
+            logger.warn("[SCHEDULER] 单店自动化失败 shop={}: {}", shop.getId(), e.getMessage());
+            Map<String, Object> r = new LinkedHashMap<>();
+            r.put("success", false);
+            r.put("message", msg);
+            return r;
+        }
+    }
+
     private Map<String, Object> doRun(String trigger, Long userId) {
         long start = System.currentTimeMillis();
         logger.info("[SCHEDULER] 自动流水线开始({})...", trigger);
@@ -177,6 +340,8 @@ public class DailyCaptureScheduler {
                 int added = reviewService.saveScrapedReviews(shop.getId(), shop.getName(), reviews);
                 totalFetched += fetched;
                 totalAdded += added;
+                shop.setLastScrapeTime(LocalDateTime.now());
+                shopRepository.save(shop);
 
                 // 2.2 自动回复（开关开启时）
                 if (Boolean.TRUE.equals(shop.getAutoReplyEnabled())) {
@@ -231,6 +396,8 @@ public class DailyCaptureScheduler {
 
                 shopOk++;
                 perShop.append(shop.getName()).append("(+").append(added).append(") ");
+                shop.setLastAutomationTime(LocalDateTime.now());
+                shopRepository.save(shop);
             } catch (ShopNotFoundException sne) {
                 shopAborted = true;
                 missingShop = shop.getName();

@@ -38,6 +38,16 @@
           <el-tag v-if="s.foodSafetyAutoAppeal" size="small" type="danger" effect="plain">食安自动</el-tag>
         </div>
         <div class="order-actions">
+          <el-button
+            size="small"
+            type="success"
+            plain
+            :loading="shopRunningId === s.id"
+            :disabled="isRunning || shopRunningId !== null"
+            @click="runShop(s)"
+          >
+            执行该店
+          </el-button>
           <el-button size="small" :disabled="i === 0 || orderBusy || isRunning" @click="moveShop(i, -1)">上移</el-button>
           <el-button size="small" :disabled="i === orderList.length - 1 || orderBusy || isRunning" @click="moveShop(i, 1)">下移</el-button>
         </div>
@@ -139,6 +149,7 @@ const automationStore = useAutomationStore()
 const shopStore = useShopStore()
 
 const starting = ref(false)
+const shopRunningId = ref<number | null>(null)
 const orderBusy = ref(false)
 const orderList = ref<Shop[]>([])
 const lastResult = ref<any>(null)
@@ -290,6 +301,37 @@ const handleStart = async () => {
     }
   } finally {
     starting.value = false
+    automationStore.fetchStatus().catch(() => {})
+  }
+}
+
+// 单店执行：仅对一家店铺跑一次完整流水线
+const runShop = async (s: Shop) => {
+  try {
+    await ElMessageBox.confirm(
+      `仅对「${s.name}」执行一次自动化：抓取评价（2 小时内已抓取或已执行过自动化则跳过抓取）→ 自动回复 → 差评申诉 → 申诉回查 → 食安抓取 → 食安自动申诉 → 食安回查。执行期间请不要操作美团浏览器窗口。`,
+      '单店执行确认',
+      { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+
+  shopRunningId.value = s.id
+  try {
+    const resp: any = await automationApi.runShopPipeline(s.id)
+    lastResult.value = resp?.detail || {
+      success: resp?.success,
+      message: resp?.message
+    }
+    if (resp?.success) ElMessage.success(resp.message || `店铺「${s.name}」执行完成`)
+    else ElMessage.warning(resp?.message || '执行完成（部分失败）')
+  } catch (error: any) {
+    if (!alertIfShopNotFound(error)) {
+      ElMessage.error(error?.response?.data?.message || error?.message || '执行失败')
+    }
+  } finally {
+    shopRunningId.value = null
     automationStore.fetchStatus().catch(() => {})
   }
 }

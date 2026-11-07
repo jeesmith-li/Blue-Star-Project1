@@ -1,1 +1,0 @@
-import{x as n}from"./index-DilqS6TQ.js";async function c(e,t){const r=t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br/>");try{return await n.confirm(r,e,{confirmButtonText:"确认执行",cancelButtonText:"取消",type:"warning",dangerouslyUseHTMLString:!0}),!0}catch{return!1}}export{c};

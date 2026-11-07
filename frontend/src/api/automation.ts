@@ -38,6 +38,11 @@ export const automationApi = {
     return request.post('/automation/start', null, { timeout: 1800000 })
   },
 
+  // 单店执行：仅对指定店铺跑一次完整流水线（2 小时内已抓取/已执行过自动化则跳过抓取评价）
+  runShopPipeline(shopId: number): Promise<any> {
+    return request.post(`/automation/shop/${shopId}`, null, { timeout: 1800000 })
+  },
+
   pauseAutomation(): Promise<void> {
     return request.post('/automation/pause')
   },
